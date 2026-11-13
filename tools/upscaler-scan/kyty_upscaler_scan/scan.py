@@ -262,7 +262,8 @@ class Store:
             prof = build_profile(g)
             name = profile_name(prof)
             readable = _hexify({k: v for k, v in prof.items() if k != 'runtime'})
-            readable['runtime'] = prof['runtime']
+            # (An executable that cannot be analysed has no runtime block: its profile says so instead of failing here.)
+            readable['runtime'] = prof.get('runtime')
             _write_json(self.root / name, readable)
             prof = readable
         key = str(Path(path).expanduser().resolve())

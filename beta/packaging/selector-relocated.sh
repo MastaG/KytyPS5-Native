@@ -156,7 +156,12 @@ for a in "$@"; do
 done
 astro_root="$beta_data/astro/not-matched"
 if [[ "$up_build" == 1 && "$mode" == upstream && "$content_title" == PPSA21567 ]]; then
-    bound="$(python3 -I "$bundle_root/prepare-runtime.py" --astro "$astro_game_arg")" || exit 2
+    # A copy this package cannot bind (another region/version, an unreadable archive) is not an error: the game
+    # then takes the scanned route below, or its own upscaler. Never refuse the launch over it.
+    bound="$(python3 -I "$bundle_root/prepare-runtime.py" --astro "$astro_game_arg")" || {
+        echo '[Kyty launcher] The tested ASTRO BOT profile could not be matched to this copy; continuing without it.' >&2
+        bound=
+    }
     if [[ -n "$bound" ]]; then astro_root="$bound"; fi
 fi
 astro_binary="$bundle_root/emulator/kyty_emulator_astro"
@@ -198,7 +203,14 @@ if [[ "$astro_manual" == "0" && "$up_build" == "1" && "$mode" == "upstream" && -
     done
     scan_path="${game_arg%%!/*}" # an archived game is passed as <archive>.zar!/<game root>
     if [[ -n "$scan_path" ]]; then
-        up_profile="$(python3 -I "$scanner" ensure "$scan_path" 2>/dev/null)" || up_profile=
+        # Keep the scanner's own message: a failed scan must be visible in the game's log, never silent.
+        scan_log="$(mktemp "${TMPDIR:-/tmp}/kyty-scan.XXXXXXXX" 2>/dev/null)" || scan_log=/dev/null
+        up_profile="$(python3 -I "$scanner" ensure "$scan_path" 2>"$scan_log")" || up_profile=
+        if [[ -z "$up_profile" ]]; then
+            scan_why="$(tail -n 1 -- "$scan_log" 2>/dev/null)" || scan_why=
+            echo "[Kyty launcher] The upscaler scan of this game failed (${scan_why:-no message}); it runs without a scanned upscaler profile." >&2
+        fi
+        if [[ "$scan_log" != /dev/null ]]; then rm -f -- "$scan_log"; fi
     fi
     if [[ -n "$up_profile" && -f "$up_profile" ]]; then
         read -r up_state up_fg_state up_adapter < <(python3 -I - "$up_profile" <<'PY'
@@ -243,8 +255,16 @@ fi
 if [[ ( "$selected" == "$auto_binary" || "$selected" == "$taa_binary" ) && -n "$up_profile" && "$up_kind" != game ]]; then
     preset_tool="$(dirname -- "$scanner")/kyty-render-preset"
     if [[ -f "$preset_tool" ]]; then
-        preset_plan="$(python3 -I "$preset_tool" --profile "$up_profile" --preset "$up_preset")" || exit 2
-        if [[ -n "$preset_plan" ]]; then export KYTY_RENDER_PRESET_PATCH="$preset_plan"; fi
+        if preset_plan="$(python3 -I "$preset_tool" --profile "$up_profile" --preset "$up_preset")"; then
+            if [[ -n "$preset_plan" ]]; then export KYTY_RENDER_PRESET_PATCH="$preset_plan"; fi
+        else
+            # Without its render size the HLX route would run at the game's full resolution (on Demon's Souls that
+            # did not fit in GPU memory together with frame generation). Start the game with its own upscaler
+            # instead of refusing the launch.
+            echo "[Kyty launcher] The $up_preset render preset could not be prepared for this game; using the game's own upscaler for this launch." >&2
+            up_kind=game
+            export KYTY_UPSCALER=game
+        fi
     fi
 fi
 

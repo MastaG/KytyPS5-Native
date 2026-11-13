@@ -10,7 +10,8 @@ import sys
 
 
 def generate(profile, preset, cache):
-    spec = profile.get('runtime', {}).get('taa', {}).get('startup_render_presets')
+    # (A profile of a game without a supported route has "runtime": null.)
+    spec = ((profile.get('runtime') or {}).get('taa') or {}).get('startup_render_presets')
     if preset == 'dynamic' or not spec:
         return None
     if spec.get('kind') != 'mode_render_pair_v1':
@@ -55,7 +56,7 @@ def main():
         result = generate(json.loads(Path(args.profile).read_text()), args.preset, args.cache)
         if result:
             print(result)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         print(f'Render preset: {error}', file=sys.stderr)
         return 1
     return 0

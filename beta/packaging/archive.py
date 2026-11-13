@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import os, stat, sys, tarfile, zipfile
-base = Path(__file__).resolve().parent.parent
+base = Path(os.environ.get('KYTY_BETA_BASE') or Path(__file__).resolve().parent.parent)
 kind = sys.argv[1]
 root = base/'work/KytyPS5-Beta.AppDir'
 version = (root/'VERSION').read_text().strip()
 name = f'KytyPS5-BC250-{version}-x86_64'
 dist = base/'dist'; dist.mkdir(exist_ok=True)
 if kind == 'tar':
-    with tarfile.open(dist/(name+'.tar.gz'),'w:gz',compresslevel=6) as t: t.add(root,arcname=name)
+    def neutral(info):
+        # The packager's account is not package content.
+        info.uid = info.gid = 0; info.uname = info.gname = 'root'
+        return info
+    with tarfile.open(dist/(name+'.tar.gz'),'w:gz',compresslevel=6) as t: t.add(root,arcname=name,filter=neutral)
 elif kind == 'zip':
     with zipfile.ZipFile(dist/(name+'.zip'),'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
         for p in sorted(root.rglob('*')):

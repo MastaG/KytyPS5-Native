@@ -8,6 +8,7 @@ copy of the data so that pointer tables (shader records, name tables) can be fol
 from __future__ import annotations
 
 import bisect
+import re
 import struct
 
 PT_LOAD, PT_DYNAMIC = 1, 2
@@ -22,6 +23,9 @@ DT_OS = {
     'SYMTABSZ': 0x6100003f,
 }
 _ID_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-'
+
+# `lea r64, [rip+disp32]`: REX.W (48 or 4C), 8D, ModRM with mod=00 and rm=101; every byte position is a candidate.
+_RIP_LEA = re.compile(rb'(?=[\x48\x4c]\x8d[\x05\x0d\x15\x1d\x25\x2d\x35\x3d])', re.DOTALL)
 
 
 class UnsupportedImage(ValueError):
@@ -337,8 +341,20 @@ class SelfImage:
         """Candidate `lea r64, [rip+disp32]` (REX.W 8D /r, mod=00 rm=101) sites whose operand is `target_rva`."""
         if not hasattr(self, '_lea_index'):
             index: dict[int, list[int]] = {}
-            import numpy as np
+            try:
+                import numpy as np
+            except ImportError:  # pure-Python fallback (the packaged Python has no numpy): same result
+                np = None
             for seg in self.code_segments():
+                if np is None:
+                    code = seg.data
+                    last = len(code) - 7
+                    for m in _RIP_LEA.finditer(code):
+                        at = m.start()
+                        if at > last:
+                            break
+                        index.setdefault(seg.vaddr + at + 7 + struct.unpack_from('<i', code, at + 3)[0], []).append(seg.vaddr + at)
+                    continue
                 b = np.frombuffer(seg.data, dtype=np.uint8)
                 if len(b) < 7:
                     continue

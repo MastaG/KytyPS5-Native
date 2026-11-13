@@ -67,6 +67,9 @@ def main(argv=None):
         except (OSError, ValueError) as e:
             print(f'{a.game}: {e}', file=sys.stderr)
             return 1
+        except Exception as e:  # an executable the analysis does not understand must never stop the launch
+            print(f'{a.game}: scan error: {type(e).__name__}: {e}', file=sys.stderr)
+            return 1
         print(path)
     elif a.cmd == 'status':
         try:
@@ -78,6 +81,9 @@ def main(argv=None):
                               'runtime_verified': bool(rt and rt.get('runtime_bindings_verified'))}))
         except (OSError, ValueError) as e:
             print(json.dumps({'state': 'error', 'line': f'Scan failed: {e}'}))
+            return 1
+        except Exception as e:  # always one JSON line for the launcher, whatever the executable looks like
+            print(json.dumps({'state': 'error', 'line': f'Scan failed: {type(e).__name__}: {e}'}))
             return 1
     elif a.cmd == 'library':
         cfg = json.loads(Path(a.config).expanduser().read_text(encoding='utf-8'))
