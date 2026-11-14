@@ -890,6 +890,22 @@ include("${KYTY_SOURCE_DIR}/graphics/native_gpu/nativeGpu.cmake")
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 
+# BC-250 fork: the native HLX upscaler and FSR 3 frame generation (graphics/native_gpu/nativeUpscaler.cpp,
+# graphics/presentation/window/frameGen.cpp, AMD FidelityFX SDK in 3rdparty/fidelityfx). OFF: the plain emulator.
+option(KYTY_NATIVE_UPSCALER "Build the BC-250 native upscaler and FSR 3 frame generation" OFF)
+if(KYTY_NATIVE_UPSCALER AND LINUX)
+	add_subdirectory("${KYTY_THIRD_PARTY_DIR}/fidelityfx" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/fidelityfx")
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER=1)
+	target_link_libraries(kyty_emulator kyty_fidelityfx)
+endif()
+# BC-250 fork, release packages: link against the libm of an older distribution (a directory holding its libm.so,
+# e.g. a symlink to SteamOS's libm.so.6) so the binary also runs on that glibc. Only libm's newest symbol versions
+# (sqrtf, sinh, ... at GLIBC_2.43/2.44 on current Arch) are above what the C library itself needs.
+set(KYTY_COMPAT_LIBM_DIR "" CACHE PATH "Directory with an older distribution's libm.so to link against")
+if(KYTY_COMPAT_LIBM_DIR)
+	target_link_options(kyty_emulator PRIVATE "-L${KYTY_COMPAT_LIBM_DIR}")
+endif()
+
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
 add_custom_target(kyty_trophy_sound
 	COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:kyty_emulator>/assets/sounds"
