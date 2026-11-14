@@ -1131,12 +1131,9 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 
 bool Presenter::PresentLastFrame() {
 	Common::LockGuard lock(m_impl->present_mutex);
-	// A pause shows the newest queued frame. An overlay refresh (VideoOut, on every vblank that showed nothing new,
-	// e.g. with the performance overlay on) only presents what is on screen: flushing there broke dynamic frame
-	// generation's pair chain on almost every frame (every Advance a history reset, 2026-11-08).
-	if (IsGuestPaused()) {
-		m_impl->FlushDynamic();
-	}
+	// Overlay refreshes only present what is on screen. Flushing here would break dynamic frame
+	// generation's pair chain on nearly every vblank. The upstream window loop no longer exposes
+	// a guest-paused state, so there is no pause-specific flush in this path.
 	if (m_impl->PresentPendingReal()) {
 		return true;
 	}

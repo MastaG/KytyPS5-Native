@@ -10,6 +10,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -138,14 +139,28 @@ bool PrepareNativeShader(Shader* shader, uint32_t* patched_size) {
 		const uint64_t bytes = (uint64_t(patched.code.size()) * 4 + 4095) & ~uint64_t(4095);
 		if (bytes + original_bytes > limit - retained)
 			return refuse("shader cache budget exhausted");
-		const uint64_t address = Common::VirtualMemory::AllocAligned(
-		    0, bytes, Common::VirtualMemory::Mode::ReadWrite, 4096);
+		// The new VirtualMemory API only maps fixed addresses. Reserve a low, GPU-addressable
+		// host VA without replacing another mapping; keep allocations until process teardown.
+		// The 64 KiB stepping also prevents a failed attempt from reusing an old shader address.
+		static std::atomic<uint64_t> next_shader_va {0x000000FC00000000ULL};
+		constexpr uint64_t kVaFloor = 0x000000A000000000ULL;
+		const uint64_t step = (bytes + 65535) & ~uint64_t(65535);
+		uint64_t address = 0;
+		for (int attempt = 0; attempt < 256; ++attempt) {
+			const uint64_t top = next_shader_va.fetch_sub(step, std::memory_order_relaxed);
+			if (top < step || top - step < kVaFloor) break;
+			const uint64_t candidate = top - step;
+			if (Common::VirtualMemory::AllocFixed(candidate, bytes, Common::VirtualMemory::Mode::ReadWrite)) {
+				address = candidate;
+				break;
+			}
+		}
 		if (!address) return refuse("host allocation failed");
 		std::memcpy(reinterpret_cast<void*>(address), patched.code.data(), patched.code.size() * 4);
 		if (!Common::VirtualMemory::Protect(address, bytes, Common::VirtualMemory::Mode::Read) ||
 		    !gem->BindExternal(address, bytes, false)) {
 			gem->UnbindExternal(address, bytes);
-			Common::VirtualMemory::Free(address);
+			Common::VirtualMemory::Free(address, bytes);
 			return refuse("GPU shader mapping failed");
 		}
 		it = cache
