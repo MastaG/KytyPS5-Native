@@ -16,7 +16,10 @@ from pathlib import Path
 
 GTT_PAGES = '3670016'                       # 14 GiB of 4 KiB pages
 STOCK = {'sched_policy': '2', 'vm_update_mode': '0', 'cwsr_enable': '0'}
-PATCHED = {'sched_policy': '2', 'vm_update_mode': '0'}   # the patched module sizes its own wave save area
+# The patched module sizes its own wave save area. bc250_cc_write_mode=3 enables every compute unit the board's shader
+# arrays report (40 on most boards, 36 or 38 on some; the stock driver leaves 24), bc250_gfx_eop_events=2 delivers
+# the GPU's end-of-pipe interrupts to Kyty: both as on the PC the packages are tested on.
+PATCHED = {'sched_policy': '2', 'vm_update_mode': '0', 'bc250_cc_write_mode': '3', 'bc250_gfx_eop_events': '2'}
 MARK = '# KytyPS5-BC250 prepare-system'
 
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -318,4 +318,18 @@ if [[ "$mode" == "upstream" ]]; then
     # directory hides the user's existing saves.
     cd "$upstream_data"
 fi
+# The emulator built from Superkeka's 2026-11-13 main (native and the upscaler family) no longer has
+# --shader-optimization-type, which the launcher still sends; it would refuse to start. The older backends keep it.
+case "$(basename -- "$selected")" in
+    kyty_emulator_native|kyty_emulator_native_upscaler|kyty_emulator_auto_upscaler|kyty_emulator_launcher_taa_fg|kyty_emulator_upscaling)
+        args=()
+        while (($#)); do
+            case "$1" in
+                --shader-optimization-type) shift; (($#)) && shift ;;
+                --shader-optimization-type=*) shift ;;
+                *) args+=("$1"); shift ;;
+            esac
+        done
+        set -- "${args[@]}" ;;
+esac
 exec "$selected" "$@"

@@ -2,14 +2,17 @@
 """Re-spin a release from the previous release's package: same emulator backends and bundled runtimes, with the
 scripts and tools of this source tree laid over them.
 
-  respin.py stage  PREVIOUS_APPDIR VERSION     work/KytyPS5-Beta.AppDir = previous package + this tree's files
+  respin.py stage  PREVIOUS_APPDIR VERSION [NAME=ELF ...]
+                                               work/KytyPS5-Beta.AppDir = previous package + this tree's files; each
+                                               NAME=ELF replaces that emulator backend (and the names linked to it)
   respin.py finish PREVIOUS_APPIMAGE           manifests, FILES.sha256, AppImage (previous AppImage's runtime), tar.gz, zip
   respin.py minimal PREVIOUS_MINIMAL_TARBALL   the PS5 Minimal Mode download under the new version name
   respin.py source                             source snapshot of the committed tree (git archive HEAD)
   respin.py sums                               SHA256SUMS over dist/
 
-The work directory is $KYTY_BETA_BASE (work/, dist/, validation/). Used for Beta 5 (2026.11.13), whose changes are
-only in the launch scripts and the upscaler scanner; `build.py` builds a package from scratch.
+The work directory is $KYTY_BETA_BASE (work/, dist/, validation/). Used for Beta 5 (2026.11.13: launch scripts and
+upscaler scanner only) and Beta 6 (2026.11.15: the native and upscaler backends rebuilt from Superkeka's 2026-11-13
+main, CMake build with KYTY_NATIVE_UPSCALER and KYTY_COMPAT_LIBM_DIR); `build.py` builds a package from scratch.
 """
 import hashlib, json, os, shutil, subprocess, sys, tarfile
 from pathlib import Path
@@ -26,16 +29,22 @@ OVERLAY = {
     'tools/upscaler-scan/kyty_upscaler_scan/__main__.py': 'tools/upscaler-scan/kyty_upscaler_scan/__main__.py',
     'tools/upscaler-scan/kyty_upscaler_scan/scan.py': 'tools/upscaler-scan/kyty_upscaler_scan/scan.py',
     'tools/upscaler-scan/kyty_upscaler_scan/selfelf.py': 'tools/upscaler-scan/kyty_upscaler_scan/selfelf.py',
+    'beta/packaging/doctor.py': 'doctor.py',
+    'beta/packaging/prepare-system.py': 'prepare-system.py',
+    'beta/packaging/package-README.md': 'README.md',
 }
 CHANGES = [
-    "Upscaler scanner no longer needs numpy, which the packaged Python does not have: games on the FidelityFX FSR 3 "
-    "route (Ghost of Yotei) failed to scan in Beta 4, so only the one built-in Yotei version got HLX upscaling and "
-    "every launch of such a game repeated the failed scan",
-    "An executable the scanner cannot analyse gets an 'unsupported' profile instead of a scanner crash on every launch",
-    "A failed scan is reported in the game's log instead of being hidden",
-    "A render preset or ASTRO BOT profile that cannot be prepared falls back to the game's own upscaler instead of "
-    "refusing the launch",
-    "Package check runs the real scanner on the packaged Python (Beta 4's check used a stand-in scanner)",
+    "Emulator rebuilt from Superkeka's KytyPS5-Native main of 2026-11-13 (e204925f, 299 commits newer than Beta 5's "
+    "base) with this fork's BC-250 work merged in: upscaler and frame generation (HLX FSR 4, FSR 3), Demon's Souls TAA "
+    "frame generation and Scream recovery; Superkeka's gfx VMID reservation replaces this fork's",
+    "The native and upscaler backends come from one CMake build (KYTY_NATIVE_UPSCALER), linked against SteamOS 3.8's "
+    "libm so they need glibc 2.38 like the rest of the package; the Astro, Demon's Souls guard/audio and Fast backends "
+    "are Beta 5's",
+    "--shader-optimization-type, which the new emulator no longer has, is left out for the new backends instead of "
+    "stopping the launch",
+    "The patched BC-250 amdgpu is required: --doctor checks for 36 or more active compute units (40 on most boards, "
+    "24 on the stock driver) and the module's options; --prepare-system also sets bc250_cc_write_mode=3 and "
+    "bc250_gfx_eop_events=2",
 ]
 
 
@@ -48,8 +57,14 @@ def version():
     return (root / 'VERSION').read_text().strip()
 
 
-def stage(previous, new_version):
+def stage(previous, new_version, *replacements):
     previous = Path(previous)
+    new_backends = {}
+    for item in replacements:
+        name, _, elf = item.partition('=')
+        if not name.startswith('kyty_emulator_') or not elf or not Path(elf).is_file():
+            raise SystemExit('replacement must be kyty_emulator_NAME=/path/to/elf: ' + item)
+        new_backends[name] = Path(elf)
     old = json.loads((previous / 'BUILD-MANIFEST.json').read_text())
     if root.exists():
         shutil.rmtree(root)
@@ -76,16 +91,36 @@ def stage(previous, new_version):
         mode = (root / dst).stat().st_mode
         shutil.copyfile(repo / src, root / dst)
         (root / dst).chmod(mode)
+    elf_dir = root / 'emulator/elf'
+    replaced = {}
+    for name, elf in new_backends.items():
+        target = elf_dir / name
+        if target.is_symlink():
+            raise SystemExit(name + ' is a link in the previous package; replace the backend it points to')
+        if not target.is_file():
+            raise SystemExit('no backend ' + name + ' in the previous package')
+        aliases = [x.name for x in elf_dir.iterdir() if x.is_symlink() and x.readlink().name == name]
+        shutil.copyfile(elf, target)
+        target.chmod(0o755)
+        for n in [name] + aliases:
+            replaced[n] = {'sha256': sha(target), 'source': str(elf)}
     (root / 'VERSION').write_text(new_version + '\n')
     manifest = dict(old)
     manifest['version'] = new_version
     manifest['respin_of'] = old['version']
     manifest['changes_since_' + old['version'].rsplit('-', 1)[-1]] = CHANGES
-    manifest['changed_files'] = sorted(OVERLAY.values()) + ['VERSION', 'BUILD-MANIFEST.json', 'VALIDATION.json', 'FILES.sha256']
+    manifest['changed_files'] = sorted(OVERLAY.values()) + ['VERSION', 'BUILD-MANIFEST.json', 'VALIDATION.json', 'FILES.sha256'] + \
+        sorted('emulator/elf/' + n for n in new_backends)
+    if replaced:
+        head = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+        manifest['emulator_commit'] = head
+        manifest['backends'] = {**old['backends'], **{n: {'sha256': v['sha256'], 'commit': head} for n, v in replaced.items()}}
     (root / 'BUILD-MANIFEST.json').write_text(json.dumps(manifest, indent=2) + '\n')
     for name, info in manifest['backends'].items():
         if sha(root / 'emulator/elf' / name) != info['sha256']:
             raise SystemExit('backend changed: ' + name)
+    for name, info in replaced.items():
+        print(f'replaced {name}: {info["sha256"][:12]} from {info["source"]}')
     print('Staged ' + new_version + ' on ' + old['version'] + ': ' + str(root))
 
 
@@ -163,7 +198,8 @@ def sums():
 
 
 if __name__ == '__main__':
-    commands = {'stage': (stage, 2), 'finish': (finish, 1), 'minimal': (minimal, 1), 'source': (source, 0), 'sums': (sums, 0)}
-    if len(sys.argv) < 2 or sys.argv[1] not in commands or len(sys.argv) - 2 != commands[sys.argv[1]][1]:
+    commands = {'stage': (stage, None), 'finish': (finish, 1), 'minimal': (minimal, 1), 'source': (source, 0), 'sums': (sums, 0)}
+    if len(sys.argv) < 2 or sys.argv[1] not in commands or (
+            len(sys.argv) - 2 != commands[sys.argv[1]][1] if commands[sys.argv[1]][1] is not None else len(sys.argv) < 4):
         raise SystemExit(__doc__)
     commands[sys.argv[1]][0](*sys.argv[2:])

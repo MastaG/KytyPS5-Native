@@ -20,6 +20,19 @@ def report():
             devices.append(vendor + ':' + device)
         except OSError: pass
     check('BC-250 GPU', any(x in ('0x1002:0x13fe', '0x1002:0x13f9') for x in devices), ', '.join(devices) or 'No GPU in this environment')
+    # Active compute units, from the KFD topology (simd_count / simd_per_cu). The PS5 has 36; the BC-250's 40 (36 or 38 on
+    # some boards) need the patched amdgpu with bc250_cc_write_mode=3, else 24 are active and the GPU has ~60% of the speed.
+    cus = 0
+    for props in glob.glob('/sys/class/kfd/kfd/topology/nodes/*/properties'):
+        try:
+            kv = dict(line.split()[:2] for line in Path(props).read_text().splitlines() if len(line.split()) >= 2)
+            if int(kv.get('simd_count', 0)) > 0 and int(kv.get('simd_per_cu', 0)) > 0:
+                cus = max(cus, int(kv['simd_count']) // int(kv['simd_per_cu']))
+        except (OSError, ValueError): pass
+    data['active_compute_units'] = cus
+    check('Compute units >= 36', cus >= 36, f'{cus} active' + ('' if cus >= 36 else
+          ' (the stock amdgpu enables 24; install the patched amdgpu and run --prepare-system, then reboot)') if cus else
+          'no KFD GPU node (no /dev/kfd or amdgpu not loaded)')
     nodes = glob.glob('/dev/dri/renderD*')
     check('DRM render access', any(os.access(p, os.R_OK|os.W_OK) for p in nodes), ', '.join(nodes) or 'No render nodes')
     check('KFD access', os.access('/dev/kfd', os.R_OK|os.W_OK), '/dev/kfd')
@@ -49,11 +62,14 @@ def report():
             data['warnings'].append(f'GTT limit is {gtt_pages * 4 // 1024} MiB (ttm.pages_limit={gtt_pages}); large games need 14 GiB '
                 '(ttm.pages_limit=3670016) or stall while loading. Fix: run --prepare-system, then reboot.')
         data['notes'].append('AMDGPU: ' + ('patched BC-250 module' if patched else 'stock module'))
-        if not patched:
-            data['warnings'].append('Stock amdgpu: games run, but heavy titles leave less memory for frame generation. '
-                'Measured with Ghost of Yotei, HLX FSR 4 Quality and FSR 3 frame generation: about 400 MiB more GPU memory '
-                'than with the patched module, so frame generation stayed paused waiting for memory. For frame generation, '
-                'use the patched amdgpu (README: Optional patched amdgpu).')
+        check('Patched BC-250 amdgpu', patched, 'patched module' if patched else
+              'stock module: 24 compute units, no PS5 memory mode or GPU interrupts (README: Patched amdgpu)')
+        if patched:
+            for name, value in (('bc250_cc_write_mode', '3'), ('bc250_gfx_eop_events', '2'), ('bc250_mtype_rw', '1')):
+                try: have = Path('/sys/module/amdgpu/parameters', name).read_text().strip()
+                except OSError: have = 'unavailable'
+                if have != value:
+                    data['warnings'].append(f'amdgpu {name}={have}; the tested setting is {value}. Fix: run --prepare-system, then reboot.')
         governors = ('cyan-skillfish-governor-smu', 'cyan-skillfish-governor', 'cyan-skillfish-governor-tt', 'oberon-governor')
         try:
             running = [g for g in governors if subprocess.run(['systemctl', 'is-active', '--quiet', g + '.service'],
