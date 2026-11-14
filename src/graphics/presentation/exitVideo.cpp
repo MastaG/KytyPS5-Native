@@ -5,6 +5,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mathematics.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -13,6 +14,7 @@ extern "C" {
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <thread>
 
 #if defined(__linux__)
@@ -83,6 +85,14 @@ int PlayExitVideo(const char* path) {
 	SDL_Texture* texture = renderer != nullptr ? SDL_CreateTexture(renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING,
 	                                                               video.context->width, video.context->height)
 	                                           : nullptr;
+	// The picture keeps the video's shape in a window of another one: bars beside it, or above and below.
+	const AVRational pixel = av_guess_sample_aspect_ratio(format, format->streams[video.stream], nullptr);
+	const int        shape_width =
+	    pixel.num > 0 && pixel.den > 0 ? static_cast<int>(av_rescale(video.context->width, pixel.num, pixel.den))
+	                                   : video.context->width;
+	if (renderer != nullptr) {
+		SDL_SetRenderLogicalPresentation(renderer, shape_width, video.context->height, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+	}
 	SDL_AudioStream* sound = nullptr;
 	SwrContext*      resample = nullptr;
 	if (has_audio) {
@@ -156,10 +166,37 @@ int PlayExitVideo(const char* path) {
 		av_freep(&out);
 	};
 
+	// What ended the video before its last frame, and the first button that did not, for the log.
+	std::string    passed;
+	std::string    stopped = texture == nullptr ? std::string("no picture: ") + SDL_GetError() : std::string();
+	const uint64_t opened  = SDL_GetTicksNS();
+	auto           stop    = [&](const std::string& what) {
+		if (!quit) {
+			quit    = true;
+			stopped = what + " after " + std::to_string((SDL_GetTicksNS() - opened) / 1'000'000) + " ms";
+		}
+	};
+
 	while (!quit && av_read_frame(format, packet) >= 0) {
 		for (SDL_Event event; SDL_PollEvent(&event);) {
-			quit = quit || event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_KEY_DOWN ||
-			       event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+			if (event.type == SDL_EVENT_QUIT) {
+				stop("a quit request");
+			} else if (event.type == SDL_EVENT_KEY_DOWN) {
+				stop(std::string("key ") + SDL_GetKeyName(event.key.key) + (event.key.repeat ? " (repeat)" : ""));
+			} else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+				const auto        button = static_cast<SDL_GamepadButton>(event.gbutton.button);
+				const char*       name   = SDL_GetGamepadStringForButton(button);
+				const char*       pad    = SDL_GetGamepadNameForID(event.gbutton.which);
+				const std::string what   =
+				    std::string("button ") + (name != nullptr ? name : "?") + " of " + (pad != nullptr ? pad : "a gamepad");
+				// A press ends the video. The buttons past the D-pad do not: some pads report the touch sensors
+				// of their grips, sticks and trackpads there, down for as long as a hand holds the pad.
+				if (button <= SDL_GAMEPAD_BUTTON_DPAD_RIGHT) {
+					stop(what);
+				} else if (passed.empty()) {
+					passed = what;
+				}
+			}
 			if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
 				SDL_OpenGamepad(event.gdevice.which);
 			}
@@ -183,8 +220,16 @@ int PlayExitVideo(const char* path) {
 		SDL_Delay(10);
 	}
 
-	std::fprintf(stderr, "exit video: %s, %dx%d, %d frames shown, %d dropped, renderer %s\n", path, video.context->width,
-	             video.context->height, shown, dropped, renderer != nullptr ? SDL_GetRendererName(renderer) : "none");
+	int window_width  = 0;
+	int window_height = 0;
+	if (renderer != nullptr) {
+		SDL_GetRenderOutputSize(renderer, &window_width, &window_height);
+	}
+	const std::string outcome =
+	    (stopped.empty() ? std::string("played to the end") : "stopped by " + stopped) + (passed.empty() ? "" : ", not by " + passed);
+	std::fprintf(stderr, "exit video: %s, %dx%d in a %dx%d window, %d frames shown, %d dropped, renderer %s, %s\n", path,
+	             shape_width, video.context->height, window_width, window_height, shown, dropped,
+	             renderer != nullptr ? SDL_GetRendererName(renderer) : "none", outcome.c_str());
 
 	av_packet_free(&packet);
 	av_frame_free(&yuv);

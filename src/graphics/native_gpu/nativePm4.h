@@ -184,6 +184,7 @@ struct Pm4TranslateStats {
 	uint32_t gds_releases      = 0; // RELEASE_MEM markers that send GDS data, run natively
 	uint32_t packets_skipped   = 0; // packets left out (SetSkippedOpcodes)
 	uint32_t set_base          = 0; // IT_SET_BASE passed through (indirect argument base)
+	uint32_t set_base_typed    = 0; // SET_BASE put before an indirect draw or dispatch (Pm4CpDrawState::dispatch_base)
 	uint32_t pfp_sync_me       = 0; // IT_PFP_SYNC_ME passed through
 	uint32_t acquire_mem       = 0; // IT_ACQUIRE_MEM
 	uint32_t event_write       = 0; // IT_EVENT_WRITE
@@ -919,7 +920,11 @@ struct Pm4CpDrawState {
 	uint64_t index_base    = 0;           // INDEX_BASE
 	uint32_t index_size    = 0xffffffffu; // INDEX_BUFFER_SIZE
 	bool     index_set     = false;       // the title has sent INDEX_BASE or INDEX_BUFFER_SIZE
-	uint64_t draw_base     = 0;           // SET_BASE, BASE_INDEX 1 (indirect draw/dispatch arguments)
+	uint64_t draw_base     = 0;           // SET_BASE, BASE_INDEX 1, graphics shader type (indirect draw arguments)
+	// The PS5's CP keeps a second base for DISPATCH_INDIRECT on the gfx ring: a SET_BASE with the compute
+	// shader type sets it and leaves the draw base alone. The BC-250's has one base for both.
+	uint64_t dispatch_base = 0;     // SET_BASE, BASE_INDEX 1, compute shader type
+	bool     dispatch_set  = false; // the title has sent one
 };
 
 class Pm4Translator {
@@ -968,6 +973,8 @@ public:
 
 	// Experiment: render targets without DCC compression (CB_COLORn_INFO.DCC_ENABLE cleared).
 	void SetNoDcc(bool no_dcc) { m_no_dcc = no_dcc; }
+	// A packet that would refuse the buffer is left out and logged once instead (fail-only forms stay refusals).
+	void SetDropRefused(bool on) { m_drop_refused = on; }
 	// COMPUTE_STATIC_THREAD_MGMT_SE0..3 are ANDed with `masks` (0 for a word: left alone). KFD queues
 	// with KYTY_NATIVE_GPU_KFD_CU_CLAMP: the kernel sizes a queue's wave save area by the CUs it found
 	// at init (24 on the BC-250), and waves on the CUs enabled after it would overflow it.
@@ -1136,6 +1143,7 @@ public:
 	void SetCondExec(bool on) { m_cond_exec = on; }
 	// DRAW_INDEX_MULTI_INST, 0x3A (KYTY_NATIVE_GPU_MULTI_INST), libSceAgc's AgcDcbDrawIndexMultiInstanced: NUM_INSTANCES
 	// with the packet's count and the packet as written with NOT_EOP set, which the stock CP then runs as the PS5's does.
+	// Off: NUM_INSTANCES and one DRAW_INDEX_2, without the object ids.
 	void SetMultiInst(bool on) { m_multi_inst = on; }
 
 	// Compact references (default off): instead of every GpuRef, only the 16 MiB buckets they touch
@@ -1205,6 +1213,17 @@ public:
 		m_lod_tables.clear();
 		m_lod_stages.clear();
 		return out;
+	}
+	// What was seen since the last take, keeping the record of what has been read: the window has not ended.
+	LodBankScan TakeLodSeen() {
+		LodBankScan out = std::move(m_lod_cur);
+		m_lod_cur       = {};
+		return out;
+	}
+	// A new window: what was read counts again.
+	void ForgetLodSeen() {
+		m_lod_tables.clear();
+		m_lod_stages.clear();
 	}
 	// PFP_SYNC_ME before indirect draws and dispatches (on by default).
 	void SetPfpSyncIndirect(bool on) { m_pfp_sync_indirect = on; }
@@ -1328,6 +1347,8 @@ private:
 	bool                         m_gds = false;
 	DepthDebugMode               m_depth_mode = DepthDebugMode::None;
 	bool                         m_no_dcc     = false;
+	bool                         m_drop_refused = false;
+	std::set<uint32_t>           m_dropped_seen;
 	std::array<uint32_t, 4>      m_cu_clamp {};
 	std::vector<std::pair<uint64_t, uint64_t>> m_display_ranges; // AddDisplayRange
 	uint32_t                     m_display_dcc_off = 0;           // MRT slots drawn with DCC cleared

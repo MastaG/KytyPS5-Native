@@ -40,6 +40,8 @@ constexpr int32_t VIDEODEC2_ERROR_ACCESS_UNIT          = -2128805119; // 0x811d0
 constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0302
 
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
+constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
+constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
@@ -112,6 +114,7 @@ struct Videodec2FrameBuffer {
 };
 
 using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
+using Videodec2Vp9PictureInfo = Decoder::Vp9PictureInfo;
 
 struct Videodec2ComputeMemoryInfo {
 	size_t this_size;
@@ -307,9 +310,17 @@ static size_t MaxFrameBufferSize(const Videodec2DecoderConfigInfo& config) {
 	if (config.max_frame_width < 0 || config.max_frame_height < 0) {
 		return VIDEODEC2_MIN_MEMORY_SIZE;
 	}
-	const auto pitch = (static_cast<uint64_t>(config.max_frame_width) + 255u) & ~uint64_t {255};
-	const auto height = (static_cast<uint64_t>(config.max_frame_height) + 15u) & ~uint64_t {15};
-	return static_cast<size_t>(pitch * height * 3u / 2u + 4096u);
+	constexpr uint32_t CODEC_HEVC = 974921;
+	constexpr uint32_t CODEC_VP9  = 2382845;
+
+	const bool     vp9       = config.codec_type == CODEC_VP9;
+	const bool     ten_bit   = (config.codec_type == CODEC_HEVC || vp9) && config.profile == 2;
+	const uint64_t row_align = vp9 ? 64u : 16u;
+	const auto pitch  = (static_cast<uint64_t>(config.max_frame_width) + 255u) & ~uint64_t {255};
+	const auto height =
+	    (static_cast<uint64_t>(config.max_frame_height) + row_align - 1u) & ~(row_align - 1u);
+	const auto pixels = pitch * height * 3u / 2u * (ten_bit ? 2u : 1u);
+	return static_cast<size_t>(pixels + (vp9 ? 8192u : 4096u));
 }
 
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
@@ -543,7 +554,7 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 		return OK;
 	};
 
-	if (output_info->codec_type == 1) {
+	if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_AVC) {
 		const auto requested_size = *static_cast<const size_t*>(first_picture_info);
 		if (requested_size != sizeof(Videodec2AvcPictureInfo) &&
 		    (requested_size | 16u) != sizeof(Videodec2AvcPictureInfo)) {
@@ -552,6 +563,12 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 
 		const auto picture = Decoder::MakeAvcPictureInfo(decoded, requested_size);
 		std::memcpy(first_picture_info, &picture, requested_size);
+	} else if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_VP9) {
+		auto* picture = static_cast<Videodec2Vp9PictureInfo*>(first_picture_info);
+		if (picture->this_size != sizeof(Videodec2Vp9PictureInfo)) {
+			return VIDEODEC2_ERROR_STRUCT_SIZE;
+		}
+		*picture = Decoder::MakeVp9PictureInfo(decoded);
 	} else {
 		const auto result = fill_common(first_picture_info, true);
 		if (result != OK) {
