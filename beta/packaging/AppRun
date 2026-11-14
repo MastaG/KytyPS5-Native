@@ -10,7 +10,9 @@ export KYTYPS5_PATCH_ROOT="$KYTYPS5_DATA_ROOT/runtime/_Patches"
 export KYTYPS5_FFMPEG="$bundle_root/bin/ffmpeg"
 export KYTYPS5_UPSCALER_PROFILE_DIR="$KYTYPS5_CONFIG_ROOT/upscaler-profiles"
 export KYTYPS5_UPSCALER_SCANNER="$bundle_root/tools/upscaler-scan/kyty-upscaler-scan"
-export KYTYPS5_SESSION_CONTROL="/var/lib/kyty-beta-system/session/ps5-minimal-control"
+# A PS5 session that brings its own control (its "Return to Desktop Mode") keeps it; otherwise the one
+# --install-gaming-mode installs.
+export KYTYPS5_SESSION_CONTROL="${KYTYPS5_SESSION_CONTROL:-/var/lib/kyty-beta-system/session/ps5-minimal-control}"
 export KYTY_SHARP_EMULATOR="$bundle_root/runtime-selector.sh"
 export PATH="$bundle_root/bin:$PATH"
 export PYTHONDONTWRITEBYTECODE=1

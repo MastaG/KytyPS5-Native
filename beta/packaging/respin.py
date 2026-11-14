@@ -32,6 +32,7 @@ OVERLAY = {
     'beta/packaging/doctor.py': 'doctor.py',
     'beta/packaging/prepare-system.py': 'prepare-system.py',
     'beta/packaging/package-README.md': 'README.md',
+    'beta/packaging/AppRun': 'AppRun',
 }
 CHANGES = [
     "Emulator rebuilt from Superkeka's KytyPS5-Native main of 2026-11-13 (e204925f, 299 commits newer than Beta 5's "
@@ -42,6 +43,8 @@ CHANGES = [
     "are Beta 5's",
     "--shader-optimization-type, which the new emulator no longer has, is left out for the new backends instead of "
     "stopping the launch",
+    "AppRun keeps KYTYPS5_SESSION_CONTROL when the session provides one (own PS5 sessions keep their Return to "
+    "Desktop Mode control)",
     "The patched BC-250 amdgpu is required: --doctor checks for 36 or more active compute units (40 on most boards, "
     "24 on the stock driver) and the module's options; --prepare-system also sets bc250_cc_write_mode=3 and "
     "bc250_gfx_eop_events=2",
