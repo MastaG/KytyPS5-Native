@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
 #include "common/hostException.h"
 #include "loader/demonsScreamRecovery.h"
 #include "common/logging/log.h"
@@ -39,9 +40,6 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #else
 #if defined(__APPLE__)
@@ -125,6 +123,7 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
+	bool        called = false;
 };
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
@@ -209,22 +208,26 @@ uint64_t UnresolvedImportStubCalls() {
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	t_unresolved_stub_calls++;
-	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
-		if (record_id < g_stubbed_imports.size()) {
-			const auto& record = g_stubbed_imports[record_id];
-			printf("Unresolved import stub called: %s\n", record.name.c_str());
-			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
-			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
-			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
-			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
-			     record.program.c_str());
-		} else {
-			printf("Unresolved import stub called: <bad-record>\n");
-			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
-			     log_index, record_id);
-		}
+	if (record_id >= g_stubbed_imports.size()) {
+		printf("Unresolved import stub called: <bad-record>\n");
+		return 0;
 	}
+	auto& record = g_stubbed_imports[record_id];
+	if (__atomic_exchange_n(&record.called, true, __ATOMIC_RELAXED)) {
+		return 0;
+	}
+	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
+	// A size query or a patch answered with 0 makes the caller work on nothing.
+	const bool risky = record.name.find("GetSize") != std::string::npos ||
+	                   record.name.find("QueryMemory") != std::string::npos ||
+	                   record.name.find("Patch") != std::string::npos;
+	printf("Unresolved import stub called%s: %s (%s)\n", risky ? " (returns 0 where the caller needs a value)" : "",
+	       record.name.c_str(), record.program.c_str());
+	LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
+	     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
+	     log_index, record.patch_vaddr, record.index, record.name.c_str(),
+	     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
+	     record.program.c_str());
 	return 0;
 }
 
@@ -995,6 +998,61 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 	return g_tls_cached_main_tcb;
 }
 
+static KYTY_SYSV_ABI void GuestFatalTrap(uint32_t code, uint64_t site) {
+	static std::atomic_uint32_t logged {0};
+	if (logged.fetch_add(1) < 64) {
+		char thread_name[64] = "(host thread)";
+		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+			}
+		}
+		std::printf("Guest fatal trap 0x%08" PRIx32 " at 0x%016" PRIx64 " on %s: continuing\n", code, site, thread_name);
+		LOGF("Guest fatal trap 0x%08" PRIx32 " at 0x%016" PRIx64 " on %s: continuing\n", code, site, thread_name);
+	}
+}
+
+// Stands in for a guest's `mov fs:[0x28], code; int 0x45`: logs the code and leaves the function, which
+// keeps its frame pointer in rbp.
+static uint64_t AllocateFatalTrapThunk(uint32_t code, uint64_t site) {
+	constexpr uint64_t thunk_size = 41;
+
+	if (g_unresolved_stub_thunk_pages.empty() ||
+	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
+		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+		    "unresolved_import_thunk");
+		EXIT_NOT_IMPLEMENTED(page == 0);
+		g_unresolved_stub_thunk_pages.push_back(page);
+		g_unresolved_stub_thunk_offset = 0;
+	}
+
+	auto* thunk = reinterpret_cast<uint8_t*>(g_unresolved_stub_thunk_pages.back() +
+	                                         g_unresolved_stub_thunk_offset);
+	g_unresolved_stub_thunk_offset += thunk_size;
+
+	uint8_t bytes[thunk_size] = {
+	    0x53,                                 // push rbx
+	    0x48, 0x89, 0xe3,                     // mov rbx, rsp
+	    0x48, 0x83, 0xe4, 0xf0,               // and rsp, -16
+	    0xbf, 0, 0, 0, 0,                     // mov edi, code
+	    0x48, 0xbe, 0, 0, 0, 0, 0, 0, 0, 0, // mov rsi, site
+	    0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, GuestFatalTrap
+	    0xff, 0xd0,                           // call rax
+	    0x48, 0x89, 0xdc,                     // mov rsp, rbx
+	    0x5b,                                 // pop rbx
+	    0x5d,                                 // pop rbp
+	    0xc3,                                 // ret
+	};
+	const auto target = reinterpret_cast<uint64_t>(GuestFatalTrap);
+	std::memcpy(bytes + 9, &code, sizeof(code));
+	std::memcpy(bytes + 15, &site, sizeof(site));
+	std::memcpy(bytes + 25, &target, sizeof(target));
+	std::memcpy(thunk, bytes, sizeof(bytes));
+	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(thunk), thunk_size);
+	return reinterpret_cast<uint64_t>(thunk);
+}
+
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(program->elf == nullptr);
@@ -1013,9 +1071,15 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				     reinterpret_cast<uint64_t>(ptr));
 				if (ptr + 16 < start_ptr + size && ptr[12] == 0xcd && ptr[13] == 0x45 &&
 				    ptr[14] == 0x90 && ptr[15] == 0x0f && ptr[16] == 0x0b) {
-					ptr[0] = 0x5d; // pop rbp
-					ptr[1] = 0xc3; // ret
-					std::memset(ptr + 2, 0x90, 15);
+					uint32_t code = 0;
+					std::memcpy(&code, ptr + 8, sizeof(code));
+					const uint64_t thunk = AllocateFatalTrapThunk(code, reinterpret_cast<uint64_t>(ptr));
+					ptr[0] = 0x48; // mov rax, thunk
+					ptr[1] = 0xb8;
+					std::memcpy(ptr + 2, &thunk, sizeof(thunk));
+					ptr[10] = 0xff; // jmp rax
+					ptr[11] = 0xe0;
+					std::memset(ptr + 12, 0x90, 5);
 				} else {
 					std::memset(ptr, 0x90, 12);
 				}
@@ -1342,8 +1406,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	// initializers execute on the host stack too, so grow it before calling any guest code.
 	size_t expanded_size = 0;
 	while (expanded_size < static_cast<size_t>(768) * 1024) {
-		sys_dbg_stack_info_t stack {};
-		SysStackUsage(stack);
+		const auto stack = SysStackUsage();
 		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
 		expanded_size += stack.guard_size;
 	}
@@ -1375,6 +1438,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	Common::WriteFpEnv(Common::GuestFpEnv);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
@@ -1776,6 +1840,7 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 
 		auto* tcb = reinterpret_cast<uint64_t*>(tls.ptr + tcb_offset);
 		tcb[0]    = reinterpret_cast<uint64_t>(tcb);
+		tcb[7]    = reinterpret_cast<uint64_t>(tcb);
 	}
 
 	return tls.ptr;
@@ -1858,7 +1923,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const uint64_t tsc_multiplier =
+	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
+	const bool patch_guest_instructions =
+	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1979,20 +2047,21 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
-			                module_name));
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
+			    module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result = PatchGuestInstructions(
+			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
+			    GetGuestInstructionHostFeatures(), tsc_multiplier);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
 			totals.rdpid += result.rdpid;
 			totals.clwb += result.clwb;
+			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -2005,6 +2074,11 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (totals.rdtsc.found != 0) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
+			                totals.rdtsc.native, totals.rdtsc.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};

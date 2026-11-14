@@ -1,6 +1,6 @@
 #!/bin/bash
 # Plays a PS5 game in KytyPS5-Native from a Steam shortcut (the Decky plugin adds them).
-# Usage (Steam launch options): kytyps5-run.sh "<game folder or .zar>" [--keep-steam]
+# Usage (Steam launch options): kytyps5-run.sh "<game folder or .zar>" [--keep-steam] [--console-language=<0-29>]
 #
 # By default Steam is unloaded while the game runs: Steam and its web helpers hold 2-3 GB of RAM that a
 # big PS5 game needs (Gran Turismo 7 uses ~12.6 of 14.8 GB). It comes back on any exit. --keep-steam
@@ -8,13 +8,22 @@
 # ~/.config/KytyPS5-Native/boot.webm plays before the game and exit.webm when the game is left from the
 # in-game menu (PS button). A missing file plays nothing. ~/.config/KytyPS5-Native/hdr (the plugin's HDR
 # toggle) lets the game run in HDR when gamescope outputs it.
+# ~/.config/KytyPS5-Native/addcont/<title id> lists the game's add-ons (DLC and licences), a line each:
+# <label> or <label>=<folder with its data>; a # starts a comment. A game can wait for one of them
+# forever (Ghost of Yotei stays on a black loading screen without its two).
 # Saves: ~/.local/share/KytyPS5-Native/data. Log: ~/.local/share/KytyPS5-Native/logs/<title id>.log
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 EMU=$HERE/kyty_emulator
 GAME=${1:?game folder}
 KEEP_STEAM=0
-[ "${2:-}" = --keep-steam ] && KEEP_STEAM=1
+LANGUAGE_ARGS=
+for arg in "${@:2}"; do
+	case $arg in
+	--keep-steam) KEEP_STEAM=1 ;;
+	--console-language=*) LANGUAGE_ARGS="--console-language ${arg#*=}" ;;
+	esac
+done
 # The title id (the log and the unit are named by it): from the game's param.json, inside the archive for
 # a .zar, else the folder name.
 if [ -f "$GAME" ]; then
@@ -28,6 +37,13 @@ CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/KytyPS5-Native
 SHARE=${XDG_DATA_HOME:-$HOME/.local/share}/KytyPS5-Native
 mkdir -p "$SHARE/data" "$SHARE/logs"
 LOG=$SHARE/logs/$TITLE.log
+ADDCONT_ARGS=()
+if [ -f "$CONFIG/addcont/$TITLE" ]; then
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=$(printf '%s' "${line%%#*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+		[ -n "$line" ] && ADDCONT_ARGS+=(--addcont "$line")
+	done < "$CONFIG/addcont/$TITLE"
+fi
 # Games run on the gamescope Xwayland Steam gives them, the base layer is set on the root one (:0).
 export DISPLAY=${DISPLAY:-:1}
 ROOT_DISPLAY=${KYTYPS5_ROOT_DISPLAY:-:0}
@@ -155,8 +171,10 @@ rm -f "$MARKER" "$VIDEO_FLAG"
 front "$GAME_APPID"
 {
 	echo "== $(date) $GAME"
+	[ ${#ADDCONT_ARGS[@]} -gt 0 ] && echo "add-ons from $CONFIG/addcont/$TITLE: ${ADDCONT_ARGS[*]}"
 	SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1 KYTY_EXIT_MARKER="$MARKER" KYTY_GAMESCOPE_APPID=$GAME_APPID "$EMU" --game "$GAME" \
-		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS
+		--screen-width "${SCREEN%x*}" --screen-height "${SCREEN#*x}" --fullscreen --no-splash --skip-notice-screen $HDR_ARGS $LANGUAGE_ARGS \
+		"${ADDCONT_ARGS[@]}"
 	echo "== exit=$?"
 } >> "$LOG" 2>&1 &
 EMUPID=$!

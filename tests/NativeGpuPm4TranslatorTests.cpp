@@ -497,9 +497,26 @@ void TestDmaData() {
 	Append(dcb, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
 	auto r = t.Translate(dcb);
 	Check(r.ok && r.stats.dma_data == 1, "memory DMA_DATA passed through");
+	std::vector<uint32_t> prefetch;
+	Append(prefetch, 0x50u, {0xe6204000u, 0x1000u, 0x2u, 0x0u, 0x0u, 256u}, false);
+	auto rp = t.Translate(prefetch);
+	Check(rp.ok && rp.stats.dma_data == 1, "DMA_DATA prefetch (DST_SEL 2) passed through");
 	std::vector<uint32_t> to_reg;
 	Append(to_reg, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2c00u, 0x0u, 4u | (1u << 27u)}, false);
 	Check(!t.Translate(to_reg).ok, "DMA_DATA into the register space refused");
+	{
+		Pm4Translator dropper;
+		dropper.SetDropRefused(true);
+		std::vector<uint32_t> mixed = to_reg;
+		Append(mixed, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
+		auto rd = dropper.Translate(mixed);
+		Check(rd.ok && rd.stats.dma_data == 1, "a refused DMA_DATA is left out and the rest of the buffer goes on");
+		std::vector<uint32_t> unknown;
+		Append(unknown, 0xeeu, {0x1u, 0x2u}, false);
+		Append(unknown, 0x50u, {0x0u, 0x1000u, 0x2u, 0x2000u, 0x2u, 256u}, false);
+		auto ru = dropper.Translate(unknown);
+		Check(ru.ok && ru.stats.dma_data == 1 && ru.unknown_ops.empty(), "an unknown opcode is left out and the buffer goes on");
+	}
 	std::vector<uint32_t> gds;
 	Append(gds, 0x50u, {1u << 20u, 0x1000u, 0x2u, 0x0u, 0x0u, 4u}, false);
 	Check(!t.Translate(gds).ok, "DMA_DATA into GDS refused without a GDS partition");
@@ -546,9 +563,9 @@ void TestWriteData() {
 	t.SetWriteDataNative(0);
 
 	std::vector<uint32_t> to_reg;
-	Append(to_reg, IT_WRITE_DATA, {0u, 0x2c00u, 0x0u, 0x1u}, false);
+	Append(to_reg, IT_WRITE_DATA, {0u, 0x1234u, 0x0u, 0x1u}, false);
 	auto r2 = t.Translate(to_reg);
-	Check(!r2.ok && r2.unknown_op == IT_WRITE_DATA, "WRITE_DATA to a register refused");
+	Check(!r2.ok && r2.unknown_op == IT_WRITE_DATA, "WRITE_DATA to a register outside SH, context and UCONFIG refused");
 }
 
 void TestUconfigIndexPassthrough() {
@@ -729,6 +746,38 @@ void TestIndirectDraws() {
 	Check(r.ok && r.stats.draws == 1 && r.stats.lod_stats_dropped == 1, "DRAW_INDEX_INDIRECT and GET_LOD_STATS translated");
 	const auto pkts = Decode(r.ib);
 	Check(Count(pkts, 0x25u) == 1 && Count(pkts, 0x8Eu) == 0, "indirect draw kept, LOD statistics dropped");
+}
+
+// The PS5's CP keeps the indirect draw base and the gfx ring's dispatch base apart (SET_BASE's shader type); the
+// BC-250's keeps one. Each indirect consumer gets its own base back right before it.
+void TestTypedIndirectBases() {
+	Pm4Translator         t;
+	std::vector<uint32_t> dcb;
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x10000000u, 0x2u}, false); // draw arguments at 0x2_1000_0000
+	Append(dcb, 0x11u /* IT_SET_BASE */, {1u, 0x30000000u, 0x2u}, true);  // dispatch arguments at 0x2_3000_0000
+	Append(dcb, 0x16u /* IT_DISPATCH_INDIRECT */, {0x40u, 0x41u}, false);
+	Append(dcb, 0x25u /* IT_DRAW_INDEX_INDIRECT */, {0x80u, 0u, 0u, 0u}, false);
+	auto r = t.Translate(dcb);
+	Check(r.ok && r.stats.set_base == 2 && r.stats.set_base_typed == 2, "typed bases: both consumers get their base");
+	const auto pkts = Decode(r.ib);
+	std::vector<const Packet*> seq;
+	for (const auto& p: pkts) {
+		if (p.op == 0x11u || p.op == 0x16u || p.op == 0x25u) {
+			seq.push_back(&p);
+		}
+	}
+	const auto base_of = [](const Packet* p) { return static_cast<uint64_t>(p->body[1]) | (static_cast<uint64_t>(p->body[2]) << 32u); };
+	Check(seq.size() == 6 && seq[2]->op == 0x11u && seq[2]->compute && base_of(seq[2]) == 0x230000000ull && seq[3]->op == 0x16u,
+	      "the dispatch reads the compute base");
+	Check(seq.size() == 6 && seq[4]->op == 0x11u && !seq[4]->compute && base_of(seq[4]) == 0x210000000ull && seq[5]->op == 0x25u,
+	      "the draw after a compute SET_BASE reads the graphics base again");
+	// A draw with only a graphics base, and a dispatch before any compute base: as written.
+	Pm4Translator         u;
+	std::vector<uint32_t> plain;
+	Append(plain, 0x11u /* IT_SET_BASE */, {1u, 0x10000000u, 0x2u}, false);
+	Append(plain, 0x16u /* IT_DISPATCH_INDIRECT */, {0x40u, 0x41u}, false);
+	auto ru = u.Translate(plain);
+	Check(ru.ok && ru.stats.set_base_typed == 0 && Count(Decode(ru.ib), 0x11u) == 1, "no compute base yet: the dispatch keeps the title's");
 }
 
 void TestIndirectMultiDraws() {
@@ -5210,8 +5259,19 @@ void TestCopyData() {
 			Check(HasRef(r.refs, src, 4, false), "a memory source is made resident");
 		}
 	}
-	// A register source (SRC_SEL 0), GDS (3), perf counters (4) or an atomic result (6) refuse.
-	for (uint32_t sel: {0u, 3u, 4u, 6u}) {
+	// An atomic's result (6) as written on the gfx ring.
+	{
+		const auto cb = copy(6u | (5u << 8u), 0u, dst);
+		auto       rs = t.Translate(cb);
+		Check(rs.ok && std::search(rs.ib.begin(), rs.ib.end(), cb.begin(), cb.end()) != rs.ib.end() && PassesBothChecks(rs.ib, NativeIbKind::Gfx),
+		      "COPY_DATA of an atomic's result as written");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(std::vector<uint32_t> {0xc0044002u, 6u | (5u << 8u), 0u, 0u, static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u)},
+		                       false, &bad, NativeIbKind::Compute),
+		      "and on a compute ring");
+	}
+	// A register source (SRC_SEL 0), GDS (3) or perf counters (4) refuse.
+	for (uint32_t sel: {0u, 3u, 4u}) {
 		auto r = t.Translate(copy(sel | (5u << 8u), src, dst));
 		Check(!r.ok && RefusedFor(r, RefuseWhy::CopyDataForm), "COPY_DATA from registers, GDS, counters or atomics refused");
 	}
@@ -5310,7 +5370,7 @@ void TestAtomicOps() {
 	Check(!CpuAtomicMem(&q, 0x41u, 1, 0), "a float op is not done");
 }
 
-// MEM_SEMAPHORE (SetMemSemaphore) and DRAW_INDEX_MULTI_INST (0x3A) with its switch off.
+// MEM_SEMAPHORE (SetMemSemaphore).
 void TestMemSemaphoreAnd3A() {
 	const uint64_t addr = 0x202000600ull;
 	std::vector<uint32_t> cb;
@@ -5333,10 +5393,6 @@ void TestMemSemaphoreAnd3A() {
 	c.SetMemSemaphore(Pm4Translator::MemSemaphore::AsIs);
 	auto rc = c.Translate(cb);
 	Check(!rc.ok && RefusedFor(rc, RefuseWhy::SemaphoreForm), "MEM_SEMAPHORE on MEC refused");
-
-	std::vector<uint32_t> multi = {0xc0073a00u, 3u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
-	auto r3 = t.Translate(multi);
-	Check(!r3.ok && r3.unknown_op == 0x3Au, "DrawIndexMultiInstanced (0x3A) refused while the switch is off");
 }
 
 // DRAW_INDEX_MULTI_INST (SetMultiInst, KYTY_NATIVE_GPU_MULTI_INST), AgcDcbDrawIndexMultiInstanced: N, the object-id table,
@@ -5366,10 +5422,23 @@ void TestMultiInst() {
 	};
 
 	{
+		constexpr uint32_t IT_DRAW_INDEX_2_T = 0x27u;
 		Pm4Translator         off;
-		std::vector<uint32_t> dcb = multi(3u, 36u, 0x80u);
-		auto                  r   = off.Translate(dcb);
-		Check(!r.ok && r.unknown_op == IT_MULTI_INST, "0x3A refused with the switch off (KYTY_NATIVE_GPU_MULTI_INST=0)");
+		std::vector<uint32_t> dcb;
+		Append(dcb, IT_SET_UCONFIG_REG, {0x243u, 1u}, false); // VGT_INDEX_TYPE = 32-bit
+		const auto pkt = multi(3u, 36u, 0xA0u);
+		dcb.insert(dcb.end(), pkt.begin(), pkt.end());
+		auto          r    = off.Translate(dcb);
+		const auto    pkts = Decode(r.ib);
+		const Packet* d    = FindFirst(pkts, IT_DRAW_INDEX_2_T);
+		const Packet* n    = before(pkts, d);
+		Check(r.ok && r.stats.draws == 1 && r.stats.multi_inst == 1 && Count(pkts, IT_MULTI_INST) == 0 && d != nullptr &&
+		          d->body == std::vector<uint32_t> {36u, static_cast<uint32_t>(kIndex), static_cast<uint32_t>(kIndex >> 32u), 36u, 0u},
+		      "0x3A by default: one DRAW_INDEX_2 of the same buffer, without UNROLLED_INST and NOT_EOP");
+		Check(n != nullptr && n->op == IT_NUM_INSTANCES && n->body == std::vector<uint32_t> {3u}, "with NUM_INSTANCES N right before it");
+		Check(HasRef(r.refs, kIndex, 36u * 4u, false) && !HasRef(r.refs, kTable, 0, false), "the index buffer referenced, the table not read");
+		uint32_t bad = 0;
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the strict gfx-ring check");
 	}
 
 	Pm4Translator t;
@@ -5966,25 +6035,129 @@ void TestWaitFunctionsAll() {
 }
 
 // UCONFIG registers probe uconfig-w (2.11) wrote harmlessly on the gfx ring go as written there: GE_USER_VGPR1-3,
-// GE_PC_ALLOC, TA_CS_BC_BASE_ADDR/_HI. The unprobed rest stays dropped. MEC drops all six as before (none ran there).
+// GE_PC_ALLOC, TA_CS_BC_BASE_ADDR/_HI and the registers of AgcInit's reset defaults. The unprobed rest stays dropped.
+// MEC drops them all as before (none ran there).
+void TestRegisterForms() {
+	constexpr uint32_t IT_DMA_DATA_T    = 0x50u;
+	constexpr uint32_t IT_WRITE_DATA_T  = 0x37u;
+	constexpr uint32_t IT_SET_CONTEXT_T = 0x69u;
+	constexpr uint32_t IT_SET_SH_T      = 0x76u;
+	const uint64_t     dst              = 0x230000000ull;
+	auto dma = [&](uint32_t src, uint32_t command) {
+		std::vector<uint32_t> cb;
+		Append(cb, IT_DMA_DATA_T, {1u << 31u, src, 0u, static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u), command}, false);
+		return cb;
+	};
+	uint32_t bad = 0;
+	for (const uint32_t src: {0x30148u, 0x30150u, 0x30158u, 0x30174u, 0x3017cu, 0x30184u}) {
+		const auto    cb = dma(src, 4u | (1u << 26u));
+		Pm4Translator t;
+		auto          r = t.Translate(cb);
+		Check(r.ok && std::search(r.ib.begin(), r.ib.end(), cb.begin(), cb.end()) != r.ib.end() && !HasRef(r.refs, src, 0, false),
+		      "DMA_DATA of an atomic's result as written, its source no memory");
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "and passes the gfx-ring check");
+	}
+	{
+		Pm4Translator t;
+		t.SetAudit(true);
+		auto r = t.Translate(dma(0x30000u, 4u | (1u << 26u)));
+		Check(r.ib.empty() || !r.ok || FindFirst(Decode(r.ib), IT_DMA_DATA_T) == nullptr, "DMA_DATA from another register does not go");
+		Pm4Translator d;
+		d.SetAudit(true);
+		auto rd = d.Translate(dma(0x30174u, 4u | (2u << 26u)));
+		Check(!rd.ok || FindFirst(Decode(rd.ib), IT_DMA_DATA_T) == nullptr, "nor one with a register destination");
+		Pm4Translator c;
+		c.SetComputeQueue(true);
+		c.SetComputeRing(true);
+		c.SetAudit(true);
+		auto rc = c.Translate(dma(0x30174u, 4u | (1u << 26u)));
+		const auto    pc   = Decode(rc.ib);
+		const Packet* copy = FindFirst(pc, 0x40u);
+		Check(rc.ok && FindFirst(pc, IT_DMA_DATA_T) == nullptr && copy != nullptr && copy->compute &&
+		          copy->body == std::vector<uint32_t> {6u | (5u << 8u) | (1u << 20u), 0u, 0u, static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u)} &&
+		          ValidateNativeIb(rc.ib, false, &bad, NativeIbKind::Compute),
+		      "on MEC, which it took down, COPY_DATA of the return data instead");
+		Pm4Translator g;
+		g.SetComputeQueue(true);
+		g.SetComputeRing(true);
+		g.SetAudit(true);
+		auto rg = g.Translate(dma(0x3017cu, 4u | (1u << 26u)));
+		Check(!rg.ok && RefusedFor(rg, RefuseWhy::DmaForm), "a GDS result on MEC refuses");
+	}
+	Check(!ValidateNativeIb(std::vector<uint32_t> {0xc0055002u, 1u << 31u, 0x30174u, 0u, static_cast<uint32_t>(dst), static_cast<uint32_t>(dst >> 32u),
+	                                               4u | (1u << 26u)},
+	                        false, &bad, NativeIbKind::Compute),
+	      "the compute-ring check refuses it too");
+
+	auto wr = [&](uint32_t control, uint32_t reg, std::initializer_list<uint32_t> values) {
+		std::vector<uint32_t> body {control, reg, 0u};
+		body.insert(body.end(), values.begin(), values.end());
+		std::vector<uint32_t> cb;
+		cb.push_back(0xc0003700u | ((static_cast<uint32_t>(body.size()) - 1u) << 16u));
+		cb.insert(cb.end(), body.begin(), body.end());
+		return cb;
+	};
+	{
+		Pm4Translator t;
+		auto          r    = t.Translate(wr(0u, 0xa08eu, {0xfu, 0xeu}));
+		const auto    pkts = Decode(r.ib);
+		Check(r.ok && Count(pkts, IT_WRITE_DATA_T) == 0 && Count(pkts, IT_SET_CONTEXT_T) >= 2, "WRITE_DATA to context registers as SET_CONTEXT_REG");
+		bool first = false, second = false;
+		for (const auto& p: pkts) {
+			first  = first || (p.op == IT_SET_CONTEXT_T && p.body == std::vector<uint32_t> {0x8eu, 0xfu});
+			second = second || (p.op == IT_SET_CONTEXT_T && p.body == std::vector<uint32_t> {0x8fu, 0xeu});
+		}
+		Check(first && second, "each register in turn");
+		Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "and passes the gfx-ring check");
+	}
+	{
+		Pm4Translator t;
+		auto          r    = t.Translate(wr(1u << 16u, 0x2c0cu, {7u}));
+		const auto    pkts = Decode(r.ib);
+		bool          set  = false;
+		for (const auto& p: pkts) {
+			set = set || (p.op == IT_SET_SH_T && p.body == std::vector<uint32_t> {0xcu, 7u});
+		}
+		Check(r.ok && set && Count(pkts, IT_WRITE_DATA_T) == 0, "WRITE_DATA to an SH register as SET_SH_REG");
+	}
+	{
+		Pm4Translator t;
+		auto          r    = t.Translate(wr(1u << 16u, 0xc248u, {3u}));
+		const auto    pkts = Decode(r.ib);
+		bool          set  = false;
+		for (const auto& p: pkts) {
+			set = set || (p.op == IT_SET_UCONFIG_REG && p.body == std::vector<uint32_t> {0x248u, 3u});
+		}
+		Check(r.ok && set, "WRITE_DATA to an allowed UCONFIG register as SET_UCONFIG_REG");
+		Pm4Translator d;
+		auto          rd = d.Translate(wr(1u << 16u, 0xc2c0u, {3u}));
+		Check(rd.ok && rd.stats.uconfig_skipped == 1 && rd.skipped_uconfig.count(0x2c0u) == 1, "another UCONFIG register is dropped, as a SET of it");
+		Pm4Translator o;
+		o.SetAudit(true);
+		auto ro = o.Translate(wr(1u << 16u, 0x1234u, {3u}));
+		Check(!ro.ok && RefusedFor(ro, RefuseWhy::WriteDataRegister), "a register outside the three spaces refuses");
+	}
+}
+
 void TestUconfigProbed() {
-	for (const uint32_t off: {0x25Cu, 0x25Du, 0x25Eu, 0x260u, 0x380u, 0x381u}) {
+	for (const uint32_t off: {0x25Cu, 0x25Du, 0x25Eu, 0x260u, 0x380u, 0x381u, 0x035u, 0x03Cu, 0x2BBu, 0x2C4u, 0x2D3u, 0x2E4u,
+	                          0x41Du}) {
 		Check(Pm4Translator::UconfigAllowed(off), "a probed UCONFIG register is allowed");
 	}
-	for (const uint32_t off: {0x035u, 0x03Cu, 0x2BBu, 0x2C4u, 0x2D3u, 0x2E4u, 0x41Du, 0x342u}) {
+	for (const uint32_t off: {0x342u, 0x343u, 0x2C0u, 0x2C3u, 0x2D4u, 0x2ECu, 0x420u}) {
 		Check(!Pm4Translator::UconfigAllowed(off), "an unprobed UCONFIG register stays dropped");
 	}
 	std::vector<uint32_t> dcb;
 	Append(dcb, IT_SET_UCONFIG_REG, {0x25Cu, 1u, 2u, 3u}, false);
 	Append(dcb, IT_SET_UCONFIG_REG, {0x260u, 0x40u}, false);
 	Append(dcb, IT_SET_UCONFIG_REG, {0x380u, 0x1000u, 0x2u}, false);
-	Append(dcb, IT_SET_UCONFIG_REG, {0x2BBu, 0x5u}, false);
+	Append(dcb, IT_SET_UCONFIG_REG, {0x2C0u, 0x5u}, false);
 	Append(dcb, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, false);
 	Pm4Translator t;
 	auto          r = t.Translate(dcb);
-	Check(r.ok && r.stats.uconfig_skipped == 1 && r.skipped_uconfig.count(0x2BBu) == 1 &&
+	Check(r.ok && r.stats.uconfig_skipped == 1 && r.skipped_uconfig.count(0x2C0u) == 1 &&
 	          std::search(r.ib.begin(), r.ib.end(), dcb.begin(), dcb.begin() + 12) != r.ib.end(),
-	      "on the gfx ring the three packets as written, 0x2BB dropped");
+	      "on the gfx ring the three packets as written, 0x2C0 dropped");
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Gfx), "the IB passes the gfx-ring check");
 
@@ -5995,15 +6168,26 @@ void TestUconfigProbed() {
 	Append(bc, IT_SET_UCONFIG_REG, {0x380u, 0x1000u, 0x2u}, true);
 	Append(bc, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
 	auto rc = c.Translate(bc);
-	Check(rc.ok && rc.unknown_ops.empty() && rc.stats.uconfig_skipped == 1 && rc.skipped_uconfig.count(0x380u) == 1 &&
-	          FindFirst(Decode(rc.ib), IT_SET_UCONFIG_REG) == nullptr,
-	      "on MEC TA_CS_BC_BASE_ADDR is dropped, the ACB still translates");
+	const auto    pc = Decode(rc.ib);
+	const Packet* uc = FindFirst(pc, IT_SET_UCONFIG_REG);
+	Check(rc.ok && rc.unknown_ops.empty() && rc.stats.uconfig_skipped == 0 && Count(pc, IT_SET_UCONFIG_REG) >= 2 && uc != nullptr &&
+	          uc->body == std::vector<uint32_t> {0x380u, 0x1000u},
+	      "on MEC TA_CS_BC_BASE_ADDR goes, one register a packet");
+	Check(ValidateNativeIb(rc.ib, false, &bad, NativeIbKind::Compute), "the IB passes the compute-ring check");
+	std::vector<uint32_t> bg;
+	Append(bg, IT_SET_UCONFIG_REG, {0x25Cu, 1u}, true);
+	Append(bg, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
+	auto rv = c.Translate(bg);
+	Check(rv.ok && rv.stats.uconfig_skipped == 1 && rv.skipped_uconfig.count(0x25Cu) == 1, "GE_USER_VGPR1 stays dropped on MEC");
+	Check(!ValidateNativeIb(std::vector<uint32_t> {0xc0017902u, 0x25Cu, 1u}, false, &bad, NativeIbKind::Compute),
+	      "the compute-ring check takes no other UCONFIG write");
 	static std::vector<uint32_t> pairs = {0x380u, 0x1000u, 0x381u, 0x2u};
 	std::vector<uint32_t>        table;
 	AppendIndirect(table, IT_SET_UCONFIG_REG_INDIRECT, pairs);
 	Append(table, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
 	auto rt = c.Translate(table);
-	Check(rt.ok && rt.unknown_ops.empty() && rt.stats.uconfig_skipped == 2, "and in a register table too");
+	Check(rt.ok && rt.unknown_ops.empty() && rt.stats.uconfig_skipped == 0 && Count(Decode(rt.ib), IT_SET_UCONFIG_REG) >= 2,
+	      "and from a register table too, as SET_UCONFIG_REG");
 	std::vector<uint32_t> ge;
 	Append(ge, IT_SET_UCONFIG_REG, {0x260u, 0x40u}, true);
 	Append(ge, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 1u}, true);
@@ -6489,6 +6673,7 @@ int main() {
 	TestComputeQueueDispatchIndirect();
 	TestCpDmaIdle();
 	TestIndirectDraws();
+	TestTypedIndirectBases();
 	TestIndirectMultiDraws();
 	TestContextStatePushPop();
 	TestResetQueuePop();
@@ -6568,6 +6753,7 @@ int main() {
 	TestCondExecMec();
 	TestFlattenCondExecCount();
 	TestCopyDataForms();
+	TestRegisterForms();
 	TestAtomicOpTable();
 	TestMemSemaphoreForms();
 	TestMemSemaphoreTranslated();

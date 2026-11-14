@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "emulator.h"
 #include "graphics/presentation/systemOverlay.h"
+#include "graphics/presentation/window.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -221,9 +222,14 @@ SystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance)
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	luminance->max_full_frame_tone_map_luminance = 80.0f;
-	luminance->max_tone_map_luminance            = 1000.0f;
-	luminance->min_tone_map_luminance            = 0.0f;
+	// As a PS5 whose HDR has not been adjusted in the system settings: the console keeps the three
+	// adjustment screens' results as 10-bit PQ codes and turns them into nits; without them it reports
+	// 637.32 (PQ code 0x2cf) full frame, 981.15 (0x2ff) peak and 0.12494 minimum. The full-frame value
+	// is what games tone map most of the picture to: a low one (80 nits before) gives a dim, washed out
+	// picture on an HDR display (issue #7).
+	luminance->max_full_frame_tone_map_luminance = 637.318970f;
+	luminance->max_tone_map_luminance            = 981.145996f;
+	luminance->min_tone_map_luminance            = 0.124935f;
 
 	return OK;
 }
@@ -262,10 +268,26 @@ static int KYTY_SYSV_ABI SystemServiceDisableMusicPlayer() {
 	return OK;
 }
 
+// The counterpart of sceSystemServiceDisableMusicPlayer(). A title can disable the system
+// background music player, and this call re-enables it. It's implemented whit a stub and returns 0.
+static int KYTY_SYSV_ABI sceSystemServiceReenableMusicPlayer() {
+	return OK;
+}
+
 static int KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info) {
 	PRINT_NAME();
 
 	LOGF("\t info = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
+
+	return OK;
+}
+
+static void KYTY_SYSV_ABI SystemServiceInitializePlayerDialogParam() {
+	PRINT_NAME();
+}
+
+static int KYTY_SYSV_ABI SystemServiceLaunchPlayerDialog() {
+	PRINT_NAME();
 
 	return OK;
 }
@@ -582,7 +604,10 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("Q3utJvma4Mo", SystemService::SystemServiceSetNoticeScreenSkipFlag);
 	LIB_FUNC("XbbJC3E+L5M", SystemService::SystemServicePowerTick);
 	LIB_FUNC("x1UB9bwDSOw", SystemService::SystemServiceDisableMusicPlayer);
+	LIB_FUNC("9kPCz7Or+1Y", SystemService::sceSystemServiceReenableMusicPlayer);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
+	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
+	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);
 	SystemGesture::InitSystemGesture_1(s);
 }
 

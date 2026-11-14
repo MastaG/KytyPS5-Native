@@ -128,6 +128,7 @@ bool PthreadKillHost(Pthread thread, int host_signal);
 #endif
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();
+int KYTY_SYSV_ABI PthreadSetschedparam(Pthread thread, int policy, const KernelSchedParam* param);
 
 int KYTY_SYSV_ABI          KernelUsleep(KernelUseconds microseconds);
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds);
@@ -203,6 +204,8 @@ int KYTY_SYSV_ABI      KernelConvertLocaltimeToUtc(int64_t local_time, int64_t r
 int KYTY_SYSV_ABI      KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_time,
                                                    KernelTimesec* st, uint64_t* dst_sec);
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency();
+// Guest TSC = host TSC * multiplier >> 32.
+uint64_t               KernelGuestTscMultiplier();
 uint64_t KYTY_SYSV_ABI KernelReadTsc();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter();

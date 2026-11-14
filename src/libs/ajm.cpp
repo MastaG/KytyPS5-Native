@@ -6,6 +6,7 @@
 #include "libs/ajm/decoder.h"
 #include "libs/ajm/mp3_decoder.h"
 #include "libs/ajm/opus_decoder.h"
+#include "libs/ajm/resampler.h"
 #include "libs/audio.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -63,12 +64,6 @@ struct AjmSidebandMFrame {
 	uint32_t reserved;
 };
 
-struct AjmSidebandResampleInfo {
-	float    ratio;
-	int32_t  num_samples;
-	uint32_t reserved[8];
-};
-
 struct AjmGetStatisticsResult {
 	AjmSidebandResult result;
 	float             engine_usage_batch;
@@ -104,6 +99,8 @@ constexpr uint64_t AJM_FLAG_RUN_GET_CODEC_INFO        = 1ull << 11u;
 constexpr uint64_t AJM_FLAG_RUN_MULTIPLE_FRAMES       = 1ull << 12u;
 constexpr uint64_t AJM_FLAG_CONTROL_RESET             = 1ull << 13u;
 constexpr uint64_t AJM_FLAG_CONTROL_INITIALIZE        = 1ull << 14u;
+constexpr uint64_t AJM_FLAG_CONTROL_RESAMPLE          = 1ull << 15u;
+constexpr uint64_t AJM_FLAG_CONTROL_RESAMPLE_EX       = 1ull << 16u;
 constexpr uint64_t AJM_FLAG_SIDEBAND_RESAMPLE_INFO    = 1ull << 44u;
 constexpr uint64_t AJM_FLAG_SIDEBAND_GAPLESS          = 1ull << 45u;
 constexpr uint64_t AJM_FLAG_SIDEBAND_FORMAT           = 1ull << 46u;
@@ -171,12 +168,33 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	return OK;
 }
 
+static_assert(sizeof(AjmDecMp3ParseFrameInfo) == 40);
+
+int KYTY_SYSV_ABI AjmDecMp3ParseFrame(const void* bitstream, size_t size, int parse_ofl,
+                                      AjmDecMp3ParseFrameInfo* frame_info) {
+	PRINT_NAME();
+	LOGF("\t size = %zu, parse_ofl = %d\n", size, parse_ofl);
+	if (frame_info == nullptr) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
+
+	AjmMp3FrameHeader header {};
+	if (!AjmParseMp3Header(static_cast<const uint8_t*>(bitstream), size, &header)) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
+
+	*frame_info = {header.frame_size, header.num_channels, header.samples_per_channel,
+	               header.bitrate, header.sample_rate};
+	return OK;
+}
+
 struct AjmInstanceState {
 	uint32_t                    context = 0;
 	uint32_t                    codec   = 0;
 	uint64_t                    flags   = 0;
 	AjmGaplessState             gapless;
 	std::unique_ptr<AjmDecoder> decoder;
+	AjmResampler                resampler;
 };
 
 static std::mutex                                     g_ajm_instances_mutex;
@@ -358,7 +376,7 @@ static void AjmWriteSideband(uint64_t flags, void* sideband_output, size_t sideb
 	    offset + AJM_SIDEBAND_RESAMPLE_INFO_SIZE <= sideband_output_size) {
 		auto* info = reinterpret_cast<AjmSidebandResampleInfo*>(
 		    static_cast<uint8_t*>(sideband_output) + offset);
-		info->ratio = 1.0f;
+		*info = decode_result.resample_info;
 		offset += AJM_SIDEBAND_RESAMPLE_INFO_SIZE;
 	}
 
@@ -415,6 +433,28 @@ static bool AjmCodecIsValid(uint32_t codec) {
 	}
 }
 
+// Results a title can stop a voice on. Each kind is logged a few times, with where the stream stood.
+static void AjmLogDecodeFailure(uint32_t instance, const AjmDecodeResult& result, const void* input,
+                                size_t input_size, size_t output_size) {
+	constexpr int32_t BENIGN = AJM_RESULT_PARTIAL_INPUT | AJM_RESULT_NOT_ENOUGH_ROOM;
+	if ((result.result & ~BENIGN) == 0) {
+		return;
+	}
+	static std::atomic_uint32_t logged {0};
+	if (logged.fetch_add(1) >= 32) {
+		return;
+	}
+	std::string head;
+	const auto* bytes = static_cast<const uint8_t*>(input);
+	for (size_t i = 0; bytes != nullptr && i < std::min<size_t>(input_size, 16); i++) {
+		head += fmt::sprintf("%02x", bytes[i]);
+	}
+	Log::WriteToConsoleAndLog(fmt::sprintf(
+	    "AJM: instance %u: result 0x%08x, internal %d, input %zu consumed %zu, output %zu written %zu, input starts %s\n",
+	    instance, static_cast<uint32_t>(result.result), result.internal_result, input_size,
+	    static_cast<size_t>(result.input_consumed), output_size, static_cast<size_t>(result.output_written), head));
+}
+
 static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, size_t input_size,
                                          void* output, size_t output_size, bool multiple_frames) {
 	std::scoped_lock lock(g_ajm_instances_mutex);
@@ -425,8 +465,18 @@ static AjmDecodeResult AjmDecodeInstance(uint32_t instance, const void* input, s
 		return result;
 	}
 
-	return state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
+	// The resampler requires one complete decoded packet per decoder call.
+	if (state->codec == static_cast<uint32_t>(AjmCodec::DecOpus) &&
+	    (state->flags & AJM_INSTANCE_FLAG_RESAMPLE) != 0) {
+		auto resampled = state->resampler.Decode(*state->decoder, state->flags, input, input_size, output,
+		                                         output_size, multiple_frames, &state->gapless);
+		AjmLogDecodeFailure(instance, resampled, input, input_size, output_size);
+		return resampled;
+	}
+	auto decode_result = state->decoder->Decode(input, input_size, output, output_size, multiple_frames,
 	                              &state->gapless);
+	AjmLogDecodeFailure(instance, decode_result, input, input_size, output_size);
+	return decode_result;
 }
 
 static AjmDecodeResult AjmDecodeSplitInstance(uint32_t instance, const AjmBuffer* input_buffers,
@@ -514,6 +564,32 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 		sideband_input = static_cast<const uint8_t*>(sideband_input) + AJM_SIDEBAND_GAPLESS_SIZE;
 		sideband_input_size -= AJM_SIDEBAND_GAPLESS_SIZE;
 	}
+	for (const auto flag : {AJM_FLAG_CONTROL_RESAMPLE, AJM_FLAG_CONTROL_RESAMPLE_EX}) {
+		if ((flags & flag) == 0) {
+			continue;
+		}
+		const bool   extended = flag == AJM_FLAG_CONTROL_RESAMPLE_EX;
+		const size_t size     = extended ? 12 : 8;
+		if (sideband_input == nullptr || sideband_input_size < size ||
+		    (state->flags & AJM_INSTANCE_FLAG_RESAMPLE) == 0) {
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
+		float       ratio, change = 0;
+		uint32_t    resample_flags;
+		const auto* data = static_cast<const uint8_t*>(sideband_input);
+		std::memcpy(&ratio, data, sizeof(ratio));
+		if (extended) {
+			std::memcpy(&change, data + sizeof(ratio), sizeof(change));
+		}
+		std::memcpy(&resample_flags, data + size - sizeof(resample_flags), sizeof(resample_flags));
+		result.result = state->resampler.SetParameters(ratio, change, resample_flags);
+		if (result.result != OK) {
+			return result;
+		}
+		sideband_input = data + size;
+		sideband_input_size -= size;
+	}
 	if ((flags & AJM_FLAG_CONTROL_RESET) != 0) {
 		state->gapless.Reset();
 		decoder->Reset();
@@ -524,6 +600,7 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 		result = decoder->Initialize(sideband_input, sideband_input_size);
 	}
 
+	result.resample_info = state->resampler.GetInfo();
 	return result;
 }
 
@@ -572,6 +649,7 @@ static AjmSidebandFormat AjmGetInstanceFormat(uint32_t          instance,
 	if (out_result != nullptr) {
 		*out_result        = state->decoder->MakeResult();
 		out_result->format = state->decoder->GetFormat();
+		out_result->resample_info = state->resampler.GetInfo();
 	}
 	return state->decoder->GetFormat();
 }
@@ -921,7 +999,13 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParameters(AjmBatchInfo* info, uint32_t 
                                                    float ratio, uint32_t flags, void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
+	const struct {
+		float    ratio;
+		uint32_t flags;
+	} params {ratio, flags};
+	const auto decoded = AjmControlInstance(instance, AJM_FLAG_CONTROL_RESAMPLE, &params,
+	                                        sizeof(params), nullptr, nullptr);
+	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio = %f, flags = 0x%08" PRIx32 "\n", instance,
 	     static_cast<double>(ratio), flags);
 	return AjmAppendJob(info, AJM_JOB_SET_RESAMPLE_PARAMETERS_SIZE, "set-resample");
@@ -933,7 +1017,14 @@ int KYTY_SYSV_ABI AjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_
                                                      void* result) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
-	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE);
+	const struct {
+		float    ratio;
+		float    change;
+		uint32_t flags;
+	} params {ratio_start, ratio_change_per_sample, flags};
+	const auto decoded = AjmControlInstance(instance, AJM_FLAG_CONTROL_RESAMPLE_EX, &params,
+	                                        sizeof(params), nullptr, nullptr);
+	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decoded);
 	LOGF("\t instance = 0x%08" PRIx32 ", ratio_start = %f, ratio_change = %f, flags = 0x%08" PRIx32
 	     "\n",
 	     instance, static_cast<double>(ratio_start), static_cast<double>(ratio_change_per_sample),
@@ -952,7 +1043,7 @@ int KYTY_SYSV_ABI AjmBatchJobGetResampleInfo(AjmBatchInfo* info, uint32_t instan
 	if (result != nullptr) {
 		auto* resample  = reinterpret_cast<AjmSidebandResampleInfo*>(static_cast<uint8_t*>(result) +
 		                                                             AJM_SIDEBAND_RESULT_SIZE);
-		resample->ratio = 1.0f;
+		*resample = decode_result.resample_info;
 	}
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
 	return AjmAppendJob(info, AJM_JOB_RUN_SIZE, "get-resample-info");

@@ -365,6 +365,57 @@ public:
 
 	// A stop (Shadow::StopGpu): destroys every KFD queue, the relay included, so the title's compute work
 	// stops where it stands, as the PS5 kernel stops a title's queues. Returns how many KFD destroyed.
+	// Makes GL2 drop its lines, from a job on a compute ring of amdgpu's: a wait polling cached memory keeps reading the line
+	// it holds, so a CPU store reaches it only after this. No fence is waited for. `offset` is where in the scratch area the
+	// caller keeps 8 dwords, 32-byte aligned, for the IB.
+	bool InvalidateGl2(uint32_t offset) {
+		static constexpr std::array<uint32_t, 8> kIb = {(3u << 30u) | (6u << 16u) | (0x58u << 8u) | 2u, // ACQUIRE_MEM, compute
+		                                                0u,
+		                                                0xffffffffu,
+		                                                0xffffffu,
+		                                                0u,
+		                                                0u,
+		                                                0xau,
+		                                                0x8000u | 0x4000u | 0x200u | 0x100u}; // GL2_WB, GL2_INV, GL1_INV, GLV_INV
+		volatile uint8_t* to = ScratchCpu() + offset;
+		for (size_t i = 0; i < kIb.size(); i++) {
+			reinterpret_cast<volatile uint32_t*>(to)[i] = kIb[i];
+		}
+		__sync_synchronize();
+		drm_amdgpu_cs_chunk_ib info;
+		std::memset(&info, 0, sizeof(info));
+		info.va_start    = ScratchVa() + offset;
+		info.ib_bytes    = static_cast<uint32_t>(kIb.size() * 4u);
+		info.ip_type     = AMDGPU_HW_IP_COMPUTE;
+		info.ip_instance = 0;
+		info.ring        = 0;
+		drm_amdgpu_bo_list_entry entry;
+		std::memset(&entry, 0, sizeof(entry));
+		entry.bo_handle = m_ib_handle;
+		struct drm_amdgpu_bo_list_in list;
+		std::memset(&list, 0, sizeof(list));
+		list.operation    = ~0u;
+		list.list_handle  = ~0u;
+		list.bo_number    = 1;
+		list.bo_info_size = sizeof(entry);
+		list.bo_info_ptr  = reinterpret_cast<uintptr_t>(&entry);
+		std::array<drm_amdgpu_cs_chunk, 2> chunks;
+		std::memset(chunks.data(), 0, sizeof(chunks));
+		chunks[0].chunk_id   = AMDGPU_CHUNK_ID_IB;
+		chunks[0].length_dw  = sizeof(info) / 4;
+		chunks[0].chunk_data = reinterpret_cast<uintptr_t>(&info);
+		chunks[1].chunk_id   = AMDGPU_CHUNK_ID_BO_HANDLES;
+		chunks[1].length_dw  = sizeof(list) / 4;
+		chunks[1].chunk_data = reinterpret_cast<uintptr_t>(&list);
+		const std::array<uint64_t, 2> chunk_ptrs = {reinterpret_cast<uintptr_t>(&chunks[0]), reinterpret_cast<uintptr_t>(&chunks[1])};
+		union drm_amdgpu_cs cs;
+		std::memset(&cs, 0, sizeof(cs));
+		cs.in.ctx_id     = m_ctx;
+		cs.in.num_chunks = 2;
+		cs.in.chunks     = reinterpret_cast<uintptr_t>(chunk_ptrs.data());
+		return Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_CS, &cs) == 0;
+	}
+
 	uint32_t DestroyKfdQueues() {
 		uint32_t n = 0;
 		for (KfdQueue* q: m_kfd_queue) {
@@ -402,24 +453,30 @@ public:
 		return true;
 	}
 
-	// Native PS5 per-VMID setup: reserve this DRM VM's gfxhub VMID before any
-	// title submission, then submit only the shadow-off tail and wait for it.
-	// This materializes the PASID mapping without executing a game shader.
-	// The reservation belongs to the DRM VM and is released when its fd closes;
-	// keep it for that lifetime so register restoration cannot race an explicit
-	// early unreserve here. Call during startup, before SetAsync or guest work.
-	int ReserveAndPrimeGfxVmid() {
-		if (m_async) return -EBUSY;
-		union drm_amdgpu_vm request {};
-		request.in.op = AMDGPU_VM_OP_RESERVE_VMID;
-		const int r = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_VM, &request);
-		if (r != 0) return r;
-		const Result prime = Submit(kCpShadowOff, {}, 0.5);
-		if (prime.err != 0) return prime.err;
-		if (prime.reset) return -EIO;
+	// Keeps one gfx-hub VMID for this DRM VM while its fd is open (AMDGPU_VM_OP_RESERVE_VMID), as a PS5 title's
+	// VMID never changes: per-VMID state set on it (apertures, accumulation) holds for every later job. Then
+	// runs the empty shadowing-off IB once, so the kernel maps the VMID to our PASID (IH_VMID_n_LUT).
+	// Synchronous mode only (before SetAsync). 0 or -errno.
+	int ReserveGfxVmid() {
+		if (m_async) {
+			return -EBUSY;
+		}
+		union drm_amdgpu_vm vm;
+		std::memset(&vm, 0, sizeof(vm));
+		vm.in.op    = AMDGPU_VM_OP_RESERVE_VMID;
+		const int r = Ioctl(m_drm_fd, DRM_IOCTL_AMDGPU_VM, &vm);
+		if (r != 0) {
+			return r;
+		}
+		const Result prime = Submit(kCpShadowOff, {}, 1.0);
+		if (prime.err != 0) {
+			return prime.err;
+		}
+		if (prime.reset) {
+			return -EIO;
+		}
 		return prime.submitted && prime.completed && !prime.timed_out ? 0 : -ETIMEDOUT;
 	}
-
 
 	Result Submit(std::span<const uint32_t> ib, const std::vector<uint32_t>& bo_handles,
 	              double timeout_sec, RingTarget target = {}) {
@@ -454,20 +511,24 @@ public:
 		std::vector<uint32_t> slots;
 		std::bitset<kSlots>   taken;
 		for (const auto& [at, len]: parts) {
-			const uint32_t slot = m_async ? PickSlot(target, taken) : 0;
-			taken.set(slot);
+			uint32_t slot = m_async ? PickSlot(target, taken) : 0;
 			if (m_async && m_slot[slot].seq != 0) {
-				// The slot's submission may be a streamed DCB whose CP waits for the caller's next chunk:
-				// the caller ends that chain before this thread blocks on it (SetBeforeBlockingWait).
+				// No slot is free. The one picked may hold a submission that cannot end before this very one
+				// goes: a streamed DCB whose CP waits for the caller's next chunk (the caller ends that chain
+				// first, SetBeforeBlockingWait), or an ACB waiting for a label that a later chunk of that DCB
+				// writes, which comes only after this submission. So no single slot is waited for: the first
+				// submission to end gives its slot.
 				if (!WaitSeq(m_slot[slot].seq, 0.0, m_slot[slot].target) && m_before_block) {
 					m_before_block();
 				}
-				if (!WaitSeq(m_slot[slot].seq, timeout_sec, m_slot[slot].target)) {
+				slot = WaitAnySlot(slot, taken, timeout_sec);
+				if (slot == kSlots) {
 					res.timed_out = true;
 					return res;
 				}
 				m_slot[slot].seq = 0;
 			}
+			taken.set(slot);
 			auto* dst = reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(m_ib_cpu) + slot * kSlotSize);
 			size_t padded = 0;
 			if (part_guards && at != 0) {
@@ -1103,6 +1164,25 @@ private:
 			}
 		}
 		return own != kSlots ? own : any;
+	}
+	// Every slot is in use: waits until the submission of any slot outside `taken` ends and returns that
+	// slot, or kSlots after `timeout_sec`. Between looks at them all it waits a moment on `first`.
+	uint32_t WaitAnySlot(uint32_t first, const std::bitset<kSlots>& taken, double timeout_sec) {
+		const double deadline = NowSec() + timeout_sec;
+		for (;;) {
+			for (uint32_t i = 0; i < kSlots; i++) {
+				if (!taken[i] && (m_slot[i].seq == 0 || WaitSeq(m_slot[i].seq, 0.0, m_slot[i].target))) {
+					return i;
+				}
+			}
+			const double left = deadline - NowSec();
+			if (left <= 0.0) {
+				return kSlots;
+			}
+			if (WaitSeq(m_slot[first].seq, std::min(left, 0.001), m_slot[first].target)) {
+				return first;
+			}
+		}
 	}
 	bool     m_async     = false;
 	bool     m_gfx_mem_sync = false;
