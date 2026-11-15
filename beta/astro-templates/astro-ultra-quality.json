@@ -1,0 +1,191 @@
+{
+  "schema": "kyty-upscaler-profile",
+  "schema_version": 2,
+  "scanner_version": "1.2.0",
+  "scanned_at": "2026-11-10T08:54:25+00:00",
+  "game_executed": false,
+  "gpu_used": false,
+  "game": {
+    "title_id": "PPSA21567",
+    "version": "01.018.000",
+    "name": "ASTRO BOT",
+    "sha256": "3f6873c9aa0262b3e5513201810a4c40e0dd5ee910567a3a06fcc412275a1e16",
+    "executable_bytes": "0xf74cbc7",
+    "attribute3": "0x440014",
+    "ps5_pro_enhanced": true
+  },
+  "imports": {
+    "count": 1746,
+    "libraries": [
+      "libSceAcm",
+      "libSceAgc",
+      "libSceAgcDriver",
+      "libSceAmpr",
+      "libSceAppContent",
+      "libSceAudioIn",
+      "libSceAudioOut2",
+      "libSceAudioPropagation",
+      "libSceAvPlayer",
+      "libSceCommonDialog",
+      "libSceContentExport",
+      "libSceConvertKeycode",
+      "libSceFiber",
+      "libSceFont",
+      "libSceFontFt",
+      "libSceHttp",
+      "libSceHttp2",
+      "libSceIme",
+      "libSceJson2",
+      "libSceMouse",
+      "libSceMsgDialog.native",
+      "libSceNet",
+      "libSceNetCtl",
+      "libSceNpCommerce",
+      "libSceNpCppWebApi",
+      "libSceNpEntitlementAccess",
+      "libSceNpGameIntent",
+      "libSceNpManager",
+      "libSceNpSessionSignaling",
+      "libSceNpTrophy2",
+      "libSceNpUniversalDataSystem",
+      "libSceNpWebApi2",
+      "libSceOpenPsId",
+      "libScePad",
+      "libScePlayGo",
+      "libScePlayerInvitationDialog",
+      "libScePngDec",
+      "libScePngEnc",
+      "libScePosix",
+      "libScePsml",
+      "libSceRemoteplay",
+      "libSceRtc",
+      "libSceRudp",
+      "libSceSaveData_native",
+      "libSceShare",
+      "libSceSharePlay",
+      "libSceSigninDialog",
+      "libSceSsl",
+      "libSceSysmodule",
+      "libSceSystemService",
+      "libSceUserService",
+      "libSceUserServicePlatformPrivacyWs1",
+      "libSceVideoOut",
+      "libSceVoiceChat",
+      "libc",
+      "libkernel"
+    ]
+  },
+  "psml": {
+    "libraries": [
+      "libScePsml"
+    ],
+    "other_imports": {
+      "3WVD91e12ZQ": "initialize",
+      "+2KpvixvL6E": "shared_requirements",
+      "eWoKNeB6V-k": "create_shared_resources",
+      "jEevBXmagOQ": "release_shared_resources",
+      "ArakEpzsZo0": "context_requirements",
+      "gxv3i+MTEzU": "create_context",
+      "JaLBe0P3jSU": "release_context",
+      "AHalTX9wFZY": "dispatch_size",
+      "GHna9-DvnUk": "mipmap_bias",
+      "GJY0MvuTcs8": "request_capture",
+      "LXq+6mIxpCw": "validate_object",
+      "FSGaTQze0UY": "validate_object"
+    },
+    "unknown_imports": []
+  },
+  "fidelityfx": {
+    "components": {},
+    "frame_interpolation_in_game": false
+  },
+  "selected_route": "manual-raster-taa",
+  "capabilities": {
+    "upscaler": {
+      "state": "available",
+      "route": "taa:taa_static_v1",
+      "upscalers": [
+        "hlx_fsr4",
+        "hlx_dlss_e"
+      ],
+      "reason": "Manual main-raster-TAA integration, verified against live inputs and both downstream consumers."
+    },
+    "frame_generation": {
+      "state": "available",
+      "modes": [
+        "fsr3"
+      ],
+      "reason": "Fixed 2x presentation, paired depth and motion from the main TAA, and the Astro elapsed-time fix."
+    },
+    "render_presets": {
+      "state": "dynamic_only",
+      "reason": "the game's own dynamic resolution is kept (controller not mapped)"
+    }
+  },
+  "runtime": {
+    "adapter": "taa_paths_v1",
+    "taa": {
+      "shader_hash": "f56605bfb40b392e",
+      "consumer_shader_hash": "e5bb5e402976f58b",
+      "color": [
+        0
+      ],
+      "depth": null,
+      "depth_source": "depth_target",
+      "motion": [
+        16
+      ],
+      "output": [
+        8
+      ],
+      "jitter": {
+        "path": [
+          28,
+          0
+        ],
+        "units": "uv",
+        "sign": [
+          1,
+          1
+        ]
+      },
+      "render_size": [
+        28,
+        16
+      ],
+      "size_units": "uint32",
+      "motion_vectors": "uv_current_minus_previous",
+      "formats": {
+        "color": 71,
+        "depth": 22,
+        "motion": 71,
+        "output": 71
+      },
+      "camera": {
+        "near": 0.1,
+        "far": 10000,
+        "fov": 1.0
+      },
+      "hlx_flags": 65,
+      "hudless": {
+        "encoding": "replay_a2b10g10r10",
+        "composite_shader_hash": "03e6416939305c8c",
+        "scene": [
+          0
+        ]
+      },
+      "framegen_cadence": "fixed_2x",
+      "depth_evidence": "Captured sky depth 1, foreground 0.90..0.97: standard depth; guides use minimum-depth dilation.",
+      "consumer_shader_hashes": [
+        "e5bb5e402976f58b",
+        "d337c34aa8db8ce1"
+      ],
+      "startup_render_presets": {
+        "manual_fixed": "ultra_quality_1656",
+        "plan": "astro-ultra-quality-render.json"
+      }
+    }
+  },
+  "manual_profile": true,
+  "manual_scenario": "FSR4 2944x1656 to 3840x2160 Ultra Quality test"
+}

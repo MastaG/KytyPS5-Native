@@ -1,0 +1,18 @@
+{
+  "id": "PPSA21567",
+  "version": "01.018.000",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "Manual native 3840x2160 render tier (DLAA test)",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "c62a97",
+          "off": "8b83f0230000",
+          "on": "b80400000090"
+        }
+      ]
+    }
+  ]
+}

@@ -33,6 +33,9 @@ OVERLAY = {
     'beta/packaging/prepare-system.py': 'prepare-system.py',
     'beta/packaging/package-README.md': 'README.md',
     'beta/packaging/AppRun': 'AppRun',
+    'beta/packaging/prepare-runtime.py': 'prepare-runtime.py',
+    **{'beta/astro-templates/' + f.name: 'upscalers/astro-templates/' + f.name
+       for f in sorted((Path(__file__).resolve().parents[1] / 'astro-templates').glob('*.json'))},
 }
 CHANGES = [
     "Emulator rebuilt from Superkeka's KytyPS5-Native main of 2026-11-13 (e204925f, 299 commits newer than Beta 5's "
@@ -43,6 +46,9 @@ CHANGES = [
     "are Beta 5's",
     "--shader-optimization-type, which the new emulator no longer has, is left out for the new backends instead of "
     "stopping the launch",
+    "ASTRO BOT honours every render preset: Quality 2560x1440, Balanced 2304x1296, Performance 1920x1080 and Ultra "
+    "Performance 1280x720 join Ultra Quality and Native (before, they silently became the game's own dynamic resolution, "
+    "also for the title's default Performance)",
     "AppRun keeps KYTYPS5_SESSION_CONTROL when the session provides one (own PS5 sessions keep their Return to "
     "Desktop Mode control)",
     "The patched BC-250 amdgpu is required: --doctor checks for 36 or more active compute units (40 on most boards, "
@@ -91,7 +97,8 @@ def stage(previous, new_version, *replacements):
         if sha(root / rel) != digest:
             raise SystemExit('previous package is not pristine: ' + rel)
     for src, dst in OVERLAY.items():
-        mode = (root / dst).stat().st_mode
+        mode = (root / dst).stat().st_mode if (root / dst).exists() else 0o100644
+        (root / dst).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(repo / src, root / dst)
         (root / dst).chmod(mode)
     elf_dir = root / 'emulator/elf'

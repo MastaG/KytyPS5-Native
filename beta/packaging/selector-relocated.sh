@@ -178,15 +178,23 @@ if [[ "$up_build" == "1" && "$mode" == upstream && -f "$astro_root/astro-manual.
         astro_manual=1
         up_profile="$astro_root/astro-manual.json"
         if [[ "$up_kind" != game ]]; then
+            # Fixed render tiers (upscalers/astro-templates, make-astro-presets.py): Ultra Quality 2944x1656, Quality
+            # 2560x1440, Balanced 2304x1296, Performance 1920x1080, Ultra Performance 1280x720, Native 3840x2160 (dlaa),
+            # each upscaled to 4K. Dynamic keeps the game's own resolution tiers (2432x1368 output).
             case "$up_preset" in
-                ultra_quality)
-                    up_profile="$astro_root/astro-ultra-quality.json"
-                    export KYTY_RENDER_PRESET_PATCH="$astro_root/astro-ultra-quality-render.json" ;;
-                dlaa)
-                    up_profile="$astro_root/astro-native-dlaa.json"
-                    export KYTY_RENDER_PRESET_PATCH="$astro_root/astro-native-dlaa-render.json" ;;
-                *) up_preset=dynamic ;;
+                dlaa) astro_preset=native-dlaa ;;
+                ultra_quality|quality|balanced|performance|ultra_performance) astro_preset="${up_preset//_/-}" ;;
+                *) astro_preset= ;;
             esac
+            if [[ -n "$astro_preset" && -f "$astro_root/astro-$astro_preset.json" && -f "$astro_root/astro-$astro_preset-render.json" ]]; then
+                up_profile="$astro_root/astro-$astro_preset.json"
+                export KYTY_RENDER_PRESET_PATCH="$astro_root/astro-$astro_preset-render.json"
+            else
+                if [[ "$up_preset" != dynamic ]]; then
+                    printf '[Kyty launcher] ASTRO BOT has no %s render template; using the game'"'"'s own dynamic resolution.\n' "$up_preset" >&2
+                fi
+                up_preset=dynamic
+            fi
         fi
         up_state=available up_fg_state=available up_adapter=taa_paths_v1
         # The user's Astro choice is fixed 2x. Its elapsed-time fix keeps simulation independent of real FPS.

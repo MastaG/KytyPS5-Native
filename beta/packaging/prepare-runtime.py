@@ -181,6 +181,15 @@ def astro(game_arg):
     if base.exists():
         cached = json.loads(base.read_text())
         if cached['game'].get('stamp') == stamp:
+            # Same executable: refresh the templates a newer package added or changed (new render presets).
+            for f in (bundle / 'upscalers/astro-templates').glob('*.json'):
+                obj = json.loads(f.read_text())
+                if 'game' in obj:
+                    obj['game']['location'] = cached['game'].get('location')
+                    obj['game']['stamp'] = stamp
+                text = json.dumps(obj, indent=2) + '\n'
+                if not (dest / f.name).is_file() or (dest / f.name).read_text() != text:
+                    (dest / f.name).write_text(text)
             print(dest); return
     loaded = game.load(path)
     if loaded.title_id != expected['title_id'] or loaded.version != expected['version'] or loaded.sha256 != expected['sha256']:
