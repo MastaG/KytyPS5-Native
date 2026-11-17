@@ -10,6 +10,7 @@
 // user SGPRs: s[0:1] table {scene T# 8 dw, out V# 4 dw}, s2 width, s3 height, s4 pitch (elements); s5 TGID_X, s6 TGID_Y.
   s_load_dwordx8 s[8:15], s[0:1], 0x0
   s_load_dwordx4 s[16:19], s[0:1], 0x20
+  s_load_dword s28, s[0:1], 0x34          // display pixels already encoded
   s_load_dword s27, s[0:1], 0x30          // display_mirror_x
   v_and_b32 v1, 7, v0
   v_lshrrev_b32 v2, 3, v0
@@ -31,6 +32,13 @@
 .Lload_scene:
   image_load v[4:6], v[1:2], s[8:15] dmask:0x7 dim:SQ_RSRC_IMG_2D unorm
   s_waitcnt vmcnt(0)
+  s_cmp_eq_u32 s28, 0
+  s_cbranch_scc1 .Llinear
+  v_mov_b32 v7, v4
+  v_mov_b32 v8, v5
+  v_mov_b32 v9, v6
+  s_branch .Lquantize
+.Llinear:
   // R (v4 -> v7), G (v5 -> v8), B (v6 -> v9): 12.92 x below the threshold, 1.055 x^(1/2.4) - 0.055 above
   v_mul_f32 v7, 0x414eb852, v4
   v_log_f32 v10, v4
@@ -60,6 +68,7 @@
   v_cvt_f32_f16 v7, v7
   v_cvt_f32_f16 v8, v8
   v_cvt_f32_f16 v9, v9
+.Lquantize:
   // 10-bit UNORM: clamp, x 1023, round to nearest
   v_med3_f32 v7, v7, 0, 1.0
   v_med3_f32 v8, v8, 0, 1.0

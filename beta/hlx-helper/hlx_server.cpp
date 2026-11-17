@@ -106,8 +106,10 @@ static void Check(HRESULT h, const char* what) {
 static DXGI_FORMAT Dxgi(uint32_t gfx10) {
 	switch (gfx10) {
 		case 1: return DXGI_FORMAT_R8_UNORM;
+		case 13: return DXGI_FORMAT_R16_FLOAT; // 16_FLOAT (Marvel's Wolverine's TAA depth)
 		case 22: return DXGI_FORMAT_R32_FLOAT;
 		case 29: return DXGI_FORMAT_R16G16_FLOAT;
+		case 36: return DXGI_FORMAT_R11G11B10_FLOAT; // 11_11_10_FLOAT (Marvel's Wolverine's scene colour)
 		case 71: return DXGI_FORMAT_R16G16B16A16_FLOAT;
 		default: return DXGI_FORMAT_UNKNOWN;
 	}
@@ -388,8 +390,10 @@ int main(int argc, char** argv) {
 		HANDLE h = nullptr;
 		Check(dev->CreateSharedHandle(tex[i], nullptr, GENERIC_ALL, nullptr, &h), "shared texture handle");
 		const VkFormat vf = d.Format == DXGI_FORMAT_R8_UNORM ? VK_FORMAT_R8_UNORM
+		                    : d.Format == DXGI_FORMAT_R16_FLOAT ? VK_FORMAT_R16_SFLOAT
 		                    : d.Format == DXGI_FORMAT_R32_FLOAT ? VK_FORMAT_R32_SFLOAT
 		                    : d.Format == DXGI_FORMAT_R16G16_FLOAT ? VK_FORMAT_R16G16_SFLOAT
+		                    : d.Format == DXGI_FORMAT_R11G11B10_FLOAT ? VK_FORMAT_B10G11R11_UFLOAT_PACK32
 		                                                           : VK_FORMAT_R16G16B16A16_SFLOAT;
 		fds[i] = vk.ImportAndExport(h, vf, lay.r[i].w, lay.r[i].h, &rep.size[i]);
 		if (fds[i] < 0) rep.status = -1;

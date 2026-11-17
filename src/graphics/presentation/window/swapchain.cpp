@@ -251,8 +251,18 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	if (source.backing.format == vk::Format::eA2R10G10B10UnormPack32 && image.format == vk::Format::eA2B10G10R10UnormPack32) {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = copy.srcSubresource;
+		blit.dstSubresource = copy.dstSubresource;
+		blit.srcOffsets[1] = vk::Offset3D {static_cast<int32_t>(copy.extent.width), static_cast<int32_t>(copy.extent.height), 1};
+		blit.dstOffsets[1] = blit.srcOffsets[1];
+		command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+	} else {
+		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, copy);
+	}
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
@@ -1083,6 +1093,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
+		case vk::Format::eA2R10G10B10UnormPack32:
+			// FSR's Vulkan backend accepts A2B10G10R10. Convert the displayed channels on the GPU rather than
+			// reinterpreting the bits (which swaps red/blue), so Astro can use the same interpolation path.
+			if (FrameGen::Enabled() && !hdr && !headset) frame_format = vk::Format::eA2B10G10R10UnormPack32;
+			break;
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
@@ -1166,6 +1181,11 @@ void Presenter::Present(Frame& frame) {
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	auto&             impl = *m_impl;
+	static uint64_t fg_present_inputs = 0;
+	if (FrameGen::Enabled() && (++fg_present_inputs <= 3 || fg_present_inputs % 600 == 0)) {
+		std::fprintf(stderr, "[frame generation] present layers=%zu first_bus=%d active=%d\n", layers.size(),
+		             layers.empty() ? -1 : layers[0].bus, FrameGen::Active() ? 1 : 0);
+	}
 	if (impl.fg != nullptr) {
 		impl.fg->Retire([&](uint64_t tick) { return impl.present_scheduler.IsFree(tick); });
 	}
@@ -1320,10 +1340,12 @@ void Presenter::Impl::FlushDynamic() {
 	fg_reals.clear();
 	fg_gaps.clear();
 	fg_pair_a = fg_pair_b = nullptr;
-	if (newest != layers[0].frame) {
-		ShowFrame(newest);
+	Frame* previously_shown = layers[0].frame;
+	const bool replaced = newest != previously_shown;
+	if (replaced) ShowFrame(newest); // releases the previous layer after the queue was detached
+	for (Frame* f: queued) {
+		if (!replaced || f != previously_shown) Unref(f); // that queued layer was already released by ShowFrame
 	}
-	for (Frame* f: queued) Unref(f);
 }
 
 // A flip's real frame in dynamic mode (`real` owned: busy). False: not this mode or not such a frame.
@@ -1401,8 +1423,8 @@ bool Presenter::Impl::DynamicTick() {
 	const vk::Extent2D extent = B != nullptr ? vk::Extent2D {B->frame->image.extent.width, B->frame->image.extent.height} : vk::Extent2D {};
 	FrameGen::Target   bt {}, at {};
 	if (B != nullptr) {
-		bt = {B->frame->image.image, B->frame->image.format, extent, B->frame->image.usage};
-		at = {A.frame->image.image, A.frame->image.format, extent, A.frame->image.usage};
+		bt = {B->frame->image.image, B->frame->image.format, extent, B->frame->image.usage, B->frame->fg_boundary};
+		at = {A.frame->image.image, A.frame->image.format, extent, A.frame->image.usage, A.frame->fg_boundary};
 	}
 	// The generator follows every pair in order, as soon as its second frame is here, generating or not: optical flow
 	// and FSR's history need each frame (a pair of back-to-back frames, which needs no generated frame, included).
@@ -1432,6 +1454,7 @@ bool Presenter::Impl::DynamicTick() {
 	}
 	Frame* generated = nullptr;
 	bool   shown     = false;
+	bool   dumping   = false;
 	if (usable && ready && wanted) {
 		if (command == nullptr) command = &present_scheduler.BeginCommand();
 		generated        = frames.Acquire(extent, B->frame->image.format);
@@ -1442,11 +1465,13 @@ bool Presenter::Impl::DynamicTick() {
 		generated->Transit(command->Handle(), vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite);
 		const FrameGen::Target ot {generated->image.image, generated->image.format, extent, generated->image.usage};
 		shown = (generated->image.usage & vk::ImageUsageFlagBits::eStorage) && fg->Generate(command->Handle(), bt, ot, phase);
-		generated->image.state = {vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral};
+		dumping = shown && fg->DumpRecord(command->Handle(), bt, ot);
+		generated->image.state = {vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, vk::ImageLayout::eGeneral};
 	}
 	if (command != nullptr) {
 		const uint64_t tick = present_scheduler.Submit();
 		fg->Submitted(tick);
+		if (dumping) { present_scheduler.Wait(tick); fg->DumpWrite(); }
 		A.frame->present_tick = std::max(A.frame->present_tick, tick); // read by this submission
 		B->frame->present_tick = std::max(B->frame->present_tick, tick);
 		if (generated != nullptr) {
@@ -1525,6 +1550,13 @@ bool Presenter::Impl::TryFrameGen(Frame& real) {
 	}
 	if (fg == nullptr) {
 		fg = std::make_unique<FrameGen::Generator>(window.graphic_ctx);
+	}
+	static uint64_t fg_inputs = 0;
+	if (++fg_inputs <= 3 || fg_inputs % 600 == 0) {
+		std::fprintf(stderr, "[frame generation] input %llu: format=%u hdr=%u blank=%u usage=0x%x guides=%llu\n",
+		             static_cast<unsigned long long>(fg_inputs), static_cast<unsigned>(real.image.format), real.hdr ? 1u : 0u,
+		             real.blank ? 1u : 0u, static_cast<unsigned>(static_cast<VkImageUsageFlags>(real.image.usage)),
+		             static_cast<unsigned long long>(real.fg_boundary));
 	}
 	if (real.hdr || real.blank || !(real.image.usage & vk::ImageUsageFlagBits::eSampled)) {
 		fg->Reset();

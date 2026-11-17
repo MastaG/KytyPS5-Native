@@ -3905,6 +3905,28 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	auto skip_draw = [&]() {
 		fix_display_dcc();
 #if defined(KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER) && defined(__linux__)
+		if (!m_compute_ring && NativeUpscaler::TaaBoundaryBeforeDispatch()) {
+			const uint64_t raster_ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009) & 0xffu) << 40u);
+			if (NativeUpscaler::TaaRasterShaderMatch(raster_ps)) {
+			uint32_t ud[32] {}, have = 0;
+			for (uint32_t i = 0; i < 32; ++i) {
+				if (const uint32_t* v = sh.Find(0x00Cu + i); v != nullptr) { ud[i] = *v; have |= 1u << i; }
+			}
+			const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009) & 0xffu) << 40u);
+			const uint64_t target = (static_cast<uint64_t>(reg(cx, kCbColor0Base)) << 8u) |
+			                        (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt) & 0xffu) << 40u);
+			NativeUpscaler::TaaRasterCapture(ps, ud, have, target);
+			}
+		}
+		// A TAA without a depth input: which depth buffer the scene is drawn with (Z enabled and written, a format).
+		if (!m_compute_ring && NativeUpscaler::DepthTargetWanted()) {
+			const uint32_t zinfo = reg(cx, kDbZInfo), dctl = reg(cx, 0x200u), size = reg(cx, kDbDepthSizeXy);
+			if ((zinfo & 3u) != 0 && (dctl & 6u) == 6u) {
+				const uint64_t zb = (static_cast<uint64_t>(reg(cx, kDbZReadBase + 2)) << 8u) |
+				                    (static_cast<uint64_t>(reg(cx, kDbZReadBaseHi + 2) & 0xffu) << 40u);
+				if (zb != 0) NativeUpscaler::NoteDepthTarget(zb, (size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u, zinfo);
+			}
+		}
 		// Frame generation: a draw into a video-out buffer marks whose frame's image that buffer holds; the title's UI
 		// composite also gets the HUD-less frame saved ahead of it (FgHudlessDraw).
 		if (!m_compute_ring && NativeUpscaler::FgWatchDisplay()) {
@@ -6369,9 +6391,35 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				break;
 			case IT_DRAW_INDEX_AUTO: { // a non-indexed draw: no index buffer to reference
 				log_draw(op, body_count >= 1 ? bptr[0] : 0, 0, false);
-				const bool skipped = skip_draw();
+				bool skipped = skip_draw();
 #if defined(KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER) && defined(__linux__)
 				uint64_t composite_ud = 0;
+				const uint64_t raster_ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009) & 0xffu) << 40u);
+                // Native 4K uses a raster postprocess consumer instead of the lower-resolution compute pass.
+                if (!skipped && labels && !cond.active && body_count >= 1 && bptr[0] == 3 && NativeUpscaler::TaaRasterConsumerMatch(raster_ps)) {
+                    uint32_t ud[32] {}, have=0, left=0;
+                    for (uint32_t i=0; i<32; ++i) if (const auto* v=sh.Find(0x00Cu+i)) { ud[i]=*v; have|=1u<<i; }
+                    const uint64_t packet=source_va(static_cast<uint32_t>(dw), &left);
+                    NativeUpscaler::TaaCapture(packet,raster_ps,ud,have,false);
+                    NativeUpscaler::Boundary consumer;
+                    if (NativeUpscaler::TakeBoundary(packet,raster_ps,false,&consumer)) emit_upscaler_boundary(consumer);
+                }
+				if (!skipped && labels && !cond.active && body_count >= 1 && bptr[0] == 3 && NativeUpscaler::TaaRasterShaderMatch(raster_ps)) {
+					uint32_t ud[32] {}, have = 0;
+					for (uint32_t i = 0; i < 32; ++i) if (const auto* v = sh.Find(0x00Cu + i)) { ud[i] = *v; have |= 1u << i; }
+					const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009) & 0xffu) << 40u);
+					auto target = [&](uint32_t i) { return (static_cast<uint64_t>(reg(cx, kCbColor0Base + i * kCbColorStride)) << 8u) |
+					    (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt + i) & 0xffu) << 40u); };
+					const uint32_t a2 = reg(cx, kCbColor0Attrib2);
+					NativeUpscaler::Boundary raster;
+					uint32_t left = 0;
+					if (NativeUpscaler::TakeRasterBoundary(source_va(static_cast<uint32_t>(dw), &left), ps, ud, have, target(0), target(1),
+					    ((a2 >> 14u) & 0x3fffu) + 1u, (a2 & 0x3fffu) + 1u, &raster)) {
+						emit_upscaler_boundary(raster);
+						skipped = raster.skip_dispatch;
+					}
+				}
+
 				if (!skipped && labels && !cond.active && body_count >= 1 && bptr[0] == 4 && NativeUpscaler::TaaWanted()) {
 					uint32_t ud[16] {}, have = 0;
 					for (uint32_t i = 0; i < 16; ++i) {
@@ -6389,6 +6437,45 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						emit_upscaler_boundary(composite);
 						EmitSet(body, IT_SET_SH_REG, 0x00Cu, static_cast<uint32_t>(composite_ud), false);
 						EmitSet(body, IT_SET_SH_REG, 0x00Du, static_cast<uint32_t>(composite_ud >> 32u), false);
+					}
+				}
+#endif
+#if defined(KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER) && defined(__linux__)
+				// Exact HUD-less copy using the title's own tone mapping, dithering and orientation.
+				// Replay only this profiled full-screen composite, with transparent UI, then draw its real UI below.
+				if (!skipped && labels && !cond.active && body_count >= 1 && (bptr[0] == 3 || bptr[0] == 4) && NativeUpscaler::FgHudlessShaderMatch(raster_ps)) {
+					const uint32_t info = reg(cx, kCbColor0Info), a2 = reg(cx, kCbColor0Attrib2), a3 = reg(cx, kCbColor0Attrib3);
+					const uint32_t w = ((a2 >> 14u) & 0x3fffu) + 1u, h = (a2 & 0x3fffu) + 1u;
+					const uint32_t tile = (a3 >> 14u) & 31u;
+					// The exercised video-out layout: 10_10_10_2, UNORM, standard order, no DCC or MSAA.
+					const bool layout_ok = ((info >> 2u) & 31u) == 9u && ((info >> 8u) & 7u) == 0u && ((info >> 11u) & 3u) == 1u &&
+					    (info & kCbDccEnable) == 0 && tile == 27u && reg(cx, kCbColor0View) == 0;
+					{
+						uint32_t ud[32] {}, have = 0;
+						for (uint32_t i = 0; i < 32; ++i) if (const auto* v = sh.Find(0x00Cu + i)) { ud[i] = *v; have |= 1u << i; }
+						const uint64_t ps = (static_cast<uint64_t>(reg(sh, 0x008u)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x009u) & 0xffu) << 40u);
+						std::vector<uint32_t> replay;
+						const bool replay_ok = NativeUpscaler::FgHudlessReplayDraw(ps, ud, have, replay);
+						if (replay_ok && !layout_ok) {
+							static std::atomic<unsigned> rejected {0};
+							if (rejected.fetch_add(1) < 3) std::fprintf(stderr, "[frame generation] replay layout: info=0x%x a3=0x%x view=0x%x size=%ux%u\n", info, a3, reg(cx, kCbColor0View), w, h);
+						}
+						if (replay_ok && layout_ok) {
+							body.insert(body.end(), replay.begin(), replay.end());
+							body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
+							for (uint32_t i = 8; i < 16; ++i) EmitSet(body, IT_SET_SH_REG, 0x00Cu + i, PatchSh(0x00Cu + i, ud[i]), false);
+							emit_barrier_raw(true); // all pixel/CB writes visible to the copy's image reads
+							replay.clear();
+							const uint64_t base = (static_cast<uint64_t>(reg(cx, kCbColor0Base)) << 8u) | (static_cast<uint64_t>(reg(cx, kCbColor0BaseExt) & 0xffu) << 40u);
+							if (NativeUpscaler::FgHudlessReplayCopy(base, w, h, tile, replay)) {
+								body.insert(body.end(), replay.begin(), replay.end());
+								emit_barrier_raw(true);
+								for (const uint32_t off: NativeUpscaler::kTouchedSh) {
+									const auto* v = sh.Find(off);
+									EmitSet(body, IT_SET_SH_REG, off, PatchSh(off, v != nullptr ? *v : 0u), true);
+								}
+							}
+						}
 					}
 				}
 #endif
@@ -6432,6 +6519,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.set_base++;
 				break;
 			case IT_DISPATCH_INDIRECT: // arguments at the SET_BASE address + DATA_OFFSET
+#if defined(KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER) && defined(__linux__)
+				if (NativeUpscaler::TaaWanted()) {
+					NativeUpscaler::TaaNoteIndirect((static_cast<uint64_t>(reg(sh, 0x20Cu)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20Du) & 0xffu) << 40u),
+					                                m_compute_ring);
+				}
+#endif
 				log_draw(op, 0,
 				         m_compute_queue && body_count >= 2 ? (static_cast<uint64_t>(bptr[0]) | (static_cast<uint64_t>(bptr[1] & 0xffffu) << 32u))
 				                                           : args_base(true) + (body_count >= 1 ? bptr[0] : 0u),
@@ -6489,8 +6582,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				bool                     upscaler_hit = false;
 				if (labels && !cond.active && (NativeUpscaler::Enabled() || NativeUpscaler::TaaWanted())) {
 					uint32_t left = 0;
-					// A TAA title (adapter taa_paths_v1): its TAA pass is recognised here and queued for TakeBoundary.
-					if (!m_compute_ring && NativeUpscaler::TaaWanted()) {
+					// A TAA title (taa_paths_v1 / taa_static_v1): its TAA pass is recognised here and queued for TakeBoundary,
+					// on whichever ring the title runs it (ASTRO BOT resolves on its asynchronous compute queues).
+					if (NativeUpscaler::TaaWanted()) {
 						uint32_t ud[16] = {};
 						uint32_t have   = 0;
 						for (uint32_t i = 0; i < 16; i++) {
@@ -6501,7 +6595,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						}
 						NativeUpscaler::TaaCapture(source_va(static_cast<uint32_t>(dw), &left),
 						                           (static_cast<uint64_t>(reg(sh, 0x20Cu)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20Du) & 0xffu) << 40u),
-						                           ud, have);
+						                           ud, have, m_compute_ring);
 					}
 					// The title's other FSR3 jobs of an invocation HLX replaces: dropped (a packet that emits nothing
 					// ends the direct run before it). Their register writes stay; the boundary below still comes.
@@ -6542,6 +6636,9 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 					stats.dispatches++;
 					break;
 				}
+#if defined(KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER) && defined(__linux__)
+				if (upscaler_hit && NativeUpscaler::TaaBoundaryBeforeDispatch()) emit_upscaler_boundary(upscaler);
+#endif
 				if (m_compute_ring) {
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
 					body[body.size() - size] |= 2u;
@@ -6558,7 +6655,7 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				stats.dispatches++;
 				collect_refs();
 #if defined(KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER) && defined(__linux__)
-				if (upscaler_hit) emit_upscaler_boundary(upscaler);
+				if (upscaler_hit && !NativeUpscaler::TaaBoundaryBeforeDispatch()) emit_upscaler_boundary(upscaler);
 #endif
 				break;
 			}

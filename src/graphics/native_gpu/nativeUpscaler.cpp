@@ -4,6 +4,7 @@
 #include "graphics/native_gpu/gemBacking.h"
 #include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/native_gpu/upscaler/frameGenGuard.h"
+#include "graphics/native_gpu/upscaler/taaCalibration.h"
 #include "graphics/native_gpu/upscaler/titleProfile.h"
 #include "graphics/native_gpu/upscaler/upscalerShaders.h"
 #include "graphics/shader/shaderBindings.h"
@@ -41,6 +42,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,6 +56,7 @@ namespace NativeUpscaler {
 namespace {
 using Libs::Graphics::ShaderTextureResource;
 namespace Prospero = Libs::Graphics::Prospero;
+bool CalibratedHlxFlags(uint32_t* flags); // (taa_static_v1 calibration; defined with it)
 
 // ---- Guest reads (same bounded reader as the verified FSR3 host capture) ----------------------
 bool Read(uint64_t va, void* dst, size_t n) {
@@ -100,6 +103,7 @@ struct Resource {
 struct Snapshot {
 	uint64_t                   id = 0, params = 0, packet = 0, shader = 0;
 	uint32_t                   stage = 0;
+	Resource                   raster_history; // second MRT, kept current for native-TAA fallback
 	std::array<uint64_t, 4>    job_packets {}; // each verified job's DISPATCH_DIRECT in the guest command buffer
 	int                        use_hlx = -1;   // decided once, at the first translated job: 1 HLX replaces FSR3
 	int                        fg_set  = -1;   // frame generation guide set written at this boundary
@@ -247,6 +251,7 @@ constexpr uint64_t kCodeCopy4A0  = 0x0700;
 constexpr uint64_t kCodeFgGuides = 0x0800; // frame generation guides, reduced (fg_guides.s; up to 0x800 bytes)
 constexpr uint64_t kTables       = 0x1000; // kSlots * kTablesPerSlot * 64 bytes
 constexpr uint64_t kFlags        = 0x10000; // one dword per slot: 1 = run the unpack
+constexpr uint64_t kFailFlags    = kFlags + 0x100;
 constexpr uint64_t kStamps       = 0x10400; // KYTY_NATIVE_UPSCALER_STALL: two GPU clocks per slot (16 bytes)
 constexpr uint64_t kCodeScale4A0 = 0x11000;
 constexpr uint64_t kCodeClear1   = 0x12000; // clear1.s: HLX's reactive / composition masks for titles without them (TAA)
@@ -255,6 +260,9 @@ constexpr uint64_t kCodeFgHudless = 0x12200;  // fg_hudless.s: frame generation'
 constexpr uint64_t kHudlessTables = 0x12400;  // its tables: one 64-byte table per HUD-less slot
 constexpr uint64_t kCompositeTables = 0x12800; // kSlots private {root pointers, scene/UI composite globals}, 128 bytes each
 constexpr uint64_t kPassthroughTables = 0x14800; // render-sized TAA exposure copies, separate from the final composite
+constexpr uint64_t kCodeCopy4A1 = 0x17000;
+constexpr uint64_t kCodeCalLuma = 0x16800;      // cal_luma.s: TAA calibration luminance planes (taa_static_v1)
+constexpr uint64_t kCalTables   = 0x16A00;      // its tables: two 64-byte tables per frame generation guide set
 bool StallWanted() {
 	static const bool v = [] {
 		const char* e = std::getenv("KYTY_NATIVE_UPSCALER_STALL");
@@ -263,6 +271,7 @@ bool StallWanted() {
 	return v;
 }
  // HLX output -> the title's output at another size (scale4_a0.s; up to 0x1000 bytes)
+constexpr uint64_t kTransparentUi = 0x18000; // linear 32x32 RGBA16F; Astro UI alpha is transmittance
 constexpr uint64_t kControlSize  = 0x20000;
 
 struct Region {
@@ -291,8 +300,10 @@ uint64_t                              g_sequence = 0;
 uint32_t BytesPerElement(uint32_t format) {
 	switch (format) {
 		case 1: return 1;  // 8_UNORM
+		case 13: return 2; // 16_FLOAT (Marvel's Wolverine's TAA depth)
 		case 22: return 4; // 32_FLOAT
 		case 29: return 4; // 16_16_FLOAT
+		case 36: return 4; // 11_11_10_FLOAT (HLX: R11G11B10_FLOAT; Marvel's Wolverine's scene colour)
 		case 71: return 8; // 16_16_16_16_FLOAT
 		default: return 0; // deliberately narrow: each additional encoding needs its own check
 	}
@@ -517,6 +528,7 @@ bool ConnectHlx(uint64_t total) {
 	// (HDR, inverted and infinite depth are not verified from the title's context flags.)
 	l.flags = 0x1u | 0x8u | 0x10u | 0x40u;
 	if (Prof().taa && Prof().taa_hlx_flags != 0) l.flags = Prof().taa_hlx_flags; // (the TAA title's depth / HDR conventions)
+	CalibratedHlxFlags(&l.flags); // (a calibrated static TAA: its measured depth convention)
 	if (const char* f = std::getenv("KYTY_NATIVE_UPSCALER_HLX_FLAGS")) l.flags = static_cast<uint32_t>(std::strtoul(f, nullptr, 0));
 	for (unsigned k = 0; k < 6; k++) {
 		const auto& r = g_dev.region[kHlxOrder[k]];
@@ -575,6 +587,11 @@ bool EnsureControl() {
 		return false;
 	}
 	std::memset(control.cpu, 0, kControlSize);
+	// Astro's composite is UI.rgb + scene.rgb * UI.a. A UI-free texel has alpha 1, not 0.
+	if (Prof().taa_hl_replay) {
+		auto* rgba = reinterpret_cast<uint16_t*>(control.cpu + kTransparentUi);
+		for (unsigned i = 0; i < 32u * 32u; ++i) rgba[4u * i + 3u] = 0x3c00; // FP16 1.0
+	}
 	std::memcpy(control.cpu + kCodePack, k_upscaler_pack, sizeof(k_upscaler_pack));
 	std::memcpy(control.cpu + kCodeUnpack, k_upscaler_unpack, sizeof(k_upscaler_unpack));
 	std::memcpy(control.cpu + kCodePackRg, k_upscaler_pack_rg16f, sizeof(k_upscaler_pack_rg16f));
@@ -583,6 +600,8 @@ bool EnsureControl() {
 	std::memcpy(control.cpu + kCodeCopy2, k_upscaler_copy2, sizeof(k_upscaler_copy2));
 	std::memcpy(control.cpu + kCodeCopy1, k_upscaler_copy1, sizeof(k_upscaler_copy1));
 	std::memcpy(control.cpu + kCodeCopy4A0, k_upscaler_copy4_a0, sizeof(k_upscaler_copy4_a0));
+	static_assert(sizeof(k_upscaler_copy4_a1) <= 0x100);
+	std::memcpy(control.cpu + kCodeCopy4A1, k_upscaler_copy4_a1, sizeof(k_upscaler_copy4_a1));
 	static_assert(sizeof(k_upscaler_fg_guides) <= 0x800);
 	std::memcpy(control.cpu + kCodeFgGuides, k_upscaler_fg_guides, sizeof(k_upscaler_fg_guides));
 	static_assert(sizeof(k_upscaler_scale4_a0) <= 0x1000 && kCodeScale4A0 + 0x1000 <= kControlSize);
@@ -593,6 +612,8 @@ bool EnsureControl() {
 	std::memcpy(control.cpu + kCodeCopy4Scale, k_upscaler_copy4_scale, sizeof(k_upscaler_copy4_scale));
 	static_assert(sizeof(k_upscaler_fg_hudless) <= 0x200 && kCodeFgHudless + 0x200 <= kHudlessTables);
 	std::memcpy(control.cpu + kCodeFgHudless, k_upscaler_fg_hudless, sizeof(k_upscaler_fg_hudless));
+	static_assert(sizeof(k_upscaler_cal_luma) <= 0x200 && kCodeCalLuma + 0x200 <= kCalTables && kCalTables + 0x300 <= kControlSize);
+	std::memcpy(control.cpu + kCodeCalLuma, k_upscaler_cal_luma, sizeof(k_upscaler_cal_luma));
 	__builtin_ia32_sfence();
 	g_dev.control = control; // (readers test control.cpu, written last below)
 	return true;
@@ -655,6 +676,9 @@ bool InitDevice(const Snapshot& s) {
 			r.h = target.second;
 		}
 		r.format = static_cast<uint32_t>(s.res[i].t.Format());
+		// Astro stores motion.xy in RGBA16F. The helper needs those two channels only; image_load/store converts
+		// through their real descriptors, avoiding a redundant 32 MiB at maximum resolution.
+		if (Prof().taa_raster && i == kMotion && r.format == 71u) r.format = 29u;
 		r.bpp    = BytesPerElement(r.format);
 		r.pitch  = ((r.w * r.bpp + 255u) & ~255u) / r.bpp;
 		r.offset = at;
@@ -768,7 +792,8 @@ void WriteScaleTable(uint64_t table_off, const ShaderTextureResource& src, uint3
 	p[25] = sh - 1u;
 }
 uint64_t CopyCode(uint32_t format) {
-	return format == 71 ? kCodeCopy4 : format == 29 ? kCodeCopy2 : kCodeCopy1;
+	// (by channels: the texture unit converts each side's encoding; 11_11_10 holds three)
+	return format == 71 || format == 36 ? kCodeCopy4 : format == 29 ? kCodeCopy2 : kCodeCopy1;
 }
 
 // ---- Diagnostics: bounded CPU dumps of what pack produced -----------------------------------------
@@ -1150,10 +1175,11 @@ struct FgState {
 	std::mutex                            mutex; // frame[]
 	// HUD-less frames (profile's UI composite): kFgHudless slots of hl_bytes after the guide sets, each the frame of
 	// boundary hl_id[i] (written at that frame's composite draw, complete by its flip).
+	uint32_t                                    planes  = 2; // per set (FgInit)
 	uint64_t                                    hl_base = 0, hl_bytes = 0;
 	uint32_t                                    hl_w = 0, hl_h = 0;
-	std::array<std::atomic<uint64_t>, 3>        hl_id {};
-	std::array<uint32_t, 3>                     hl_fw {}, hl_fh {};
+	std::array<std::atomic<uint64_t>, kFgSets>  hl_id {};
+	std::array<uint32_t, kFgSets>               hl_fw {}, hl_fh {};
 	std::atomic<unsigned>                       hl_next {0};
 	std::atomic<uint64_t>                       hl_last {0}; // the boundary of the last composite saved
 } g_fg;
@@ -1161,9 +1187,15 @@ struct FgState {
 // into after it holds that frame's image (FgNoteDisplayWrite).
 std::atomic<uint64_t> g_fg_translated {0};
 
+bool Calibrating(); // (taa_static_v1: the title's TAA is still being calibrated; defined with the calibration below)
+// Frame generation for the presenter: on, not paused, and (a statically discovered TAA) calibrated.
 bool FgWanted() {
 	return g_framegen.load(std::memory_order_relaxed) != static_cast<int>(FrameGenMode::Off) &&
-	       !g_fg_paused.load(std::memory_order_relaxed);
+	       !g_fg_paused.load(std::memory_order_relaxed) && !Calibrating();
+}
+// The guide planes: for frame generation, or for the calibration (which reads them itself).
+bool FgGuidesWanted() {
+	return FgWanted() || Calibrating();
 }
 // Depth and motion planes of kFgSets sets, GTT, at the render size the chosen preset fixes (the output size
 // for the title's own dynamic resolution, which renders up to it). RAM is the BC-250's tightest resource:
@@ -1180,7 +1212,9 @@ bool FgInit(uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h
 	g_fg.pitch       = ((g_fg.cap_w * 4u + 255u) & ~255u) / 4u;
 	g_fg.plane_bytes = (static_cast<uint64_t>(g_fg.pitch) * g_fg.cap_h * 4u + 0xffffu) & ~0xffffull;
 	// The HUD-less slots (titles whose profile names their UI composite): output-sized, 4 bytes a pixel, pitch = width.
-	g_fg.hl_base  = g_fg.plane_bytes * 2u * kFgSets;
+	// Planes per set: depth and motion; with a calibration also the colour input's and the output's luminance.
+	g_fg.planes   = Prof().taa_calibrate ? 4u : 2u;
+	g_fg.hl_base  = g_fg.plane_bytes * g_fg.planes * kFgSets;
 	g_fg.hl_bytes = 0;
 	if (Prof().taa_hl_hash != 0) {
 		g_fg.hl_w     = out_w;
@@ -1199,7 +1233,7 @@ bool FgInit(uint32_t render_w, uint32_t render_h, uint32_t out_w, uint32_t out_h
 // Never allocates on the translation worker (see DeviceReady): the buffer comes from its own thread.
 bool FgReady(const Snapshot& s) {
 	int st = g_fg.state.load(std::memory_order_acquire);
-	if (st == 0 && FgWanted()) {
+	if (st == 0 && FgGuidesWanted()) {
 		g_fg.state.store(1, std::memory_order_release);
 		const uint32_t out_w = Prof().taa_hl_hash != 0 ? std::max(3840u, s.Field<uint32_t>(0x700)) : s.Field<uint32_t>(0x700);
 		const uint32_t out_h = Prof().taa_hl_hash != 0 ? std::max(2160u, s.Field<uint32_t>(0x704)) : s.Field<uint32_t>(0x704);
@@ -1215,17 +1249,64 @@ bool FgReady(const Snapshot& s) {
 }
 // The title's depth and motion vectors into a free set: two pack dispatches after the accumulate dispatch.
 // Caller holds g_mutex. Sets s.fg_set on success.
+// TAA calibration (taa_static_v1): where each guide set's luminance planes are, for the calibration to read.
+struct CalPlanes {
+	uint64_t in_off = 0, out_off = 0;
+	uint32_t in_w = 0, in_h = 0, out_w = 0, out_h = 0;
+	bool     valid = false;
+};
+std::array<CalPlanes, kFgSets> g_cal_planes {}; // (g_fg.mutex)
+// One cal_luma.s dispatch: `t`'s luminance at the centre of each `factor` block into the plane at `off` (w x h).
+void EmitCalLuma(const ShaderTextureResource& t, uint64_t table_off, uint64_t off, uint32_t w, uint32_t h, uint32_t factor,
+                 bool compute_ring, std::vector<uint32_t>& ib) {
+	auto* p = reinterpret_cast<volatile uint32_t*>(g_dev.control.cpu + table_off);
+	for (unsigned i = 0; i < 8; i++) p[i] = t.fields[i];
+	const uint64_t base = g_fg.buf.va + off;
+	p[8]  = static_cast<uint32_t>(base);
+	p[9]  = (static_cast<uint32_t>(base >> 32u) & 0xffffu) | (4u << 16u); // STRIDE 4
+	p[10] = g_fg.pitch * g_fg.cap_h;                                        // NUM_RECORDS
+	p[11] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (22u << 12u) | (1u << 24u);
+	const uint64_t code = g_dev.control.va + kCodeCalLuma, tva = g_dev.control.va + table_off;
+	const uint32_t rsrc1 = ((16u / 4u) - 1u) | (0xc0u << 12u) | (1u << 21u) | (1u << 30u);
+	const uint32_t rsrc2 = (6u << 1u) | (1u << 7u) | (1u << 8u); // 6 user SGPRs, TGID_X, TGID_Y
+	SetSh(ib, 0x20Cu, {static_cast<uint32_t>(code >> 8u), static_cast<uint32_t>(code >> 40u)});
+	SetSh(ib, 0x212u, {rsrc1, rsrc2});
+	SetSh(ib, 0x228u, {0u});
+	SetSh(ib, 0x204u, {0u, 0u, 0u, 64u, 1u, 1u});
+	SetSh(ib, 0x240u, {static_cast<uint32_t>(tva), static_cast<uint32_t>(tva >> 32u), w, h, g_fg.pitch, factor});
+	ib.push_back(Pkt3(0x15, 4, compute_ring)); // DISPATCH_DIRECT
+	ib.push_back((w + 7u) / 8u);
+	ib.push_back((h + 7u) / 8u);
+	ib.push_back(1u);
+	ib.push_back(1u | (1u << 2u) | (1u << 6u));
+}
 void FgEmit(Snapshot& s, uint32_t slot, unsigned& table, bool compute_ring, std::vector<uint32_t>& ib) {
 	const auto& d = s.res[kDepth];
 	const auto& m = s.res[kMotion];
-	if (!d.present || !m.present || !Plain2D(d.t) || !Plain2D(m.t) || static_cast<uint32_t>(d.t.Format()) != 22u ||
-	    static_cast<uint32_t>(m.t.Format()) != 29u) {
+	// (a statically discovered TAA: any plain 2D formats, fg_guides.s reads them through image_load)
+	const bool formats_ok = Prof().taa_calibrate || (static_cast<uint32_t>(d.t.Format()) == 22u &&
+	                         (static_cast<uint32_t>(m.t.Format()) == 29u || (Prof().taa_raster && static_cast<uint32_t>(m.t.Format()) == 71u)));
+	if (!d.present || !m.present || !Plain2D(d.t) || !Plain2D(m.t) || !formats_ok) {
+		static std::atomic<unsigned> told {0};
+		if (told.fetch_add(1) < 3) {
+			LogJson("{\"event\":\"framegen_guides\",\"skipped\":\"inputs\",\"depth_present\":%d,\"motion_present\":%d,\"depth_plain\":%d,"
+			        "\"motion_plain\":%d,\"depth_format\":%u,\"motion_format\":%u,\"depth_type\":%u,\"motion_type\":%u}",
+			        d.present ? 1 : 0, m.present ? 1 : 0, Plain2D(d.t) ? 1 : 0, Plain2D(m.t) ? 1 : 0, static_cast<unsigned>(d.t.Format()),
+			        static_cast<unsigned>(m.t.Format()), static_cast<unsigned>(d.t.Type()), static_cast<unsigned>(m.t.Type()));
+		}
 		return;
 	}
 	const uint32_t w = s.dims[kDepth][0], h = s.dims[kDepth][1];
 	const uint32_t fit_factor = std::max<uint32_t>(1, (h + 719) / 720);
 	if ((w + fit_factor - 1) / fit_factor > g_fg.cap_w || (h + fit_factor - 1) / fit_factor > g_fg.cap_h || s.dims[kMotion] != s.dims[kDepth] ||
 	    table + 2 > kTablesPerSlot) {
+		static std::atomic<unsigned> told {0};
+		if (told.fetch_add(1) < 3) {
+			LogJson("{\"event\":\"framegen_guides\",\"skipped\":\"sizes\",\"depth\":[%u,%u],\"motion\":[%u,%u],\"color\":[%u,%u],"
+			        "\"capacity\":[%u,%u],\"depth_format\":%u,\"motion_format\":%u}",
+			        w, h, s.dims[kMotion][0], s.dims[kMotion][1], s.dims[kColor][0], s.dims[kColor][1], g_fg.cap_w, g_fg.cap_h,
+			        static_cast<unsigned>(d.t.Format()), static_cast<unsigned>(m.t.Format()));
+		}
 		return;
 	}
 	int k = -1;
@@ -1267,7 +1348,7 @@ void FgEmit(Snapshot& s, uint32_t slot, unsigned& table, bool compute_ring, std:
 	}
 	const uint32_t factor = std::max<uint32_t>(1, (h + 719) / 720);
 	const uint32_t ow = (w + factor - 1) / factor, oh = (h + factor - 1) / factor;
-	const uint64_t depth_off = static_cast<uint64_t>(2 * k) * g_fg.plane_bytes, motion_off = depth_off + g_fg.plane_bytes;
+	const uint64_t depth_off = static_cast<uint64_t>(g_fg.planes) * k * g_fg.plane_bytes, motion_off = depth_off + g_fg.plane_bytes;
 	// Table (two slots): depth T#, motion T#, then a V# over each plane (4-byte elements, untyped stores).
 	const uint64_t t = kTables + (slot * kTablesPerSlot + table) * 64u;
 	table += 2;
@@ -1287,6 +1368,7 @@ void FgEmit(Snapshot& s, uint32_t slot, unsigned& table, bool compute_ring, std:
 		}
 		p[24] = w - 1u;
 		p[25] = Prof().taa_display_mirror_x && s.stage != 5 ? 1u : 0u;
+		p[26] = FgDepthFlags() & 1u;
 	}
 	const uint64_t code = g_dev.control.va + kCodeFgGuides, tva = g_dev.control.va + t;
 	const uint32_t rsrc1 = ((16u / 4u) - 1u) | (0xc0u << 12u) | (1u << 21u) | (1u << 30u); // 16 VGPRs wave64, denorms, DX10_CLAMP, MEM_ORDERED
@@ -1301,6 +1383,20 @@ void FgEmit(Snapshot& s, uint32_t slot, unsigned& table, bool compute_ring, std:
 	ib.push_back((oh + 7u) / 8u);
 	ib.push_back(1u);
 	ib.push_back(1u | (1u << 2u) | (1u << 6u));
+	// Calibration: the colour input's luminance at the guides' size, and the output's at its own (an upscaling TAA's
+	// output is larger); both after the title's TAA ran (this pack follows its dispatch).
+	CalPlanes cp {};
+	if (Calibrating() && g_fg.planes >= 4 && s.res[kColor].present && s.res[kOutput].present && Plain2D(s.res[kColor].t) &&
+	    Plain2D(s.res[kOutput].t)) {
+		const uint32_t cw = s.dims[kColor][0], ch = s.dims[kColor][1], xw = s.dims[kOutput][0], xh = s.dims[kOutput][1];
+		const uint32_t fo = std::max<uint32_t>(1, (xh + 719) / 720);
+		const uint32_t ow2 = (xw + fo - 1) / fo, oh2 = (xh + fo - 1) / fo;
+		if (cw == w && ch == h && ow2 <= g_fg.cap_w && oh2 <= g_fg.cap_h) {
+			cp = {depth_off + 2u * g_fg.plane_bytes, depth_off + 3u * g_fg.plane_bytes, ow, oh, ow2, oh2, true};
+			EmitCalLuma(s.res[kColor].t, kCalTables + (k * 2u) * 64u, cp.in_off, ow, oh, factor, compute_ring, ib);
+			EmitCalLuma(s.res[kOutput].t, kCalTables + (k * 2u + 1u) * 64u, cp.out_off, ow2, oh2, fo, compute_ring, ib);
+		}
+	}
 	FgFrame f {};
 	f.seq        = s.id;
 	f.set        = k;
@@ -1331,13 +1427,368 @@ void FgEmit(Snapshot& s, uint32_t slot, unsigned& table, bool compute_ring, std:
 	f.fov_y      = s.Field<float>(0x724);
 	{
 		std::lock_guard lock(g_fg.mutex);
-		g_fg.frame[k] = f;
+		g_fg.frame[k]      = f;
+		g_cal_planes[k]    = cp;
 	}
 	s.fg_set = k;
 	g_fg_translated.store(s.id, std::memory_order_release);
 }
+// ---- TAA calibration (taa_static_v1, taaCalibration.h) --------------------------------------------------------------
+// While it runs the title's TAA stays (no HLX, no frame generation): each TAA invocation snapshots the constants the
+// TAA reads (TaaCapture), each finished guide set gives the luminance planes (CalFeed). The verdicts replace what a
+// hand-made profile would say (jitter, exposure, vector convention, depth convention) and are kept next to the profile
+// (<profile>.calibration.json), so the next launch starts calibrated.
+namespace Cal = TaaCalibration;
+using Profiles::JFloat;
+using Profiles::JU64;
+size_t TryRead(uint64_t va, void* dst, size_t n);
+bool   ResolvePath(const uint32_t* ud, uint32_t have, const TitleProfile::Path& path, uint64_t* out);
+bool   ReadPath(const uint32_t* ud, uint32_t have, const TitleProfile::Path& path, void* dst, size_t n, uint64_t* where = nullptr);
+struct CalResult {
+	bool               jitter_buffer = false;
+	TitleProfile::Path jitter_path;
+	uint32_t           jitter_dword = 0;
+	Cal::JitterUnits   jitter_units = Cal::JitterUnits::Uv;
+	bool               exposure_none = true, exposure_buffer = false;
+	TitleProfile::Path exposure_path;
+	uint32_t           exposure_dword = 0;
+	Cal::Convention    mv {};
+	bool               depth_inverted = true;
+};
+std::mutex                                           g_cal_mutex;
+std::atomic<int>                                     g_cal_state {0}; // 0 not loaded, 1 collecting, 2 done
+CalResult                                            g_cal;            // (g_cal_mutex until done; read-only after)
+std::map<uint64_t, std::vector<std::vector<float>>> g_cal_snaps;      // TAA invocation -> constant blocks
+std::map<uint64_t, double>                           g_cal_ratio;      // TAA invocation -> output / input luminance
+std::vector<float>                                   g_cal_prev_luma;  // the last fed frame's input luminance
+uint64_t                                             g_cal_prev_id = 0;
+Cal::VectorVotes                                     g_cal_votes;
+std::optional<bool>                                  g_cal_depth;
+uint32_t                                             g_cal_rw = 0, g_cal_rh = 0;
+uint64_t                                             g_cal_fed = 0;
+std::atomic<uint64_t>                                g_cal_snap_failures {0}, g_cal_ratio_rejects {0};
+
+std::string CalPath() {
+	const TitleProfile& P = Prof();
+	if (const char* e = std::getenv("KYTY_UPSCALER_CALIBRATION")) return e;
+	if (P.path.empty()) return {};
+	std::string out = P.path;
+	if (out.size() > 5 && out.compare(out.size() - 5, 5, ".json") == 0) out.resize(out.size() - 5);
+	return out + ".calibration.json";
+}
+const char* UnitsName(Cal::JitterUnits u) {
+	return u == Cal::JitterUnits::Uv ? "uv" : u == Cal::JitterUnits::Ndc ? "ndc" : "pixels";
+}
+bool UnitsFrom(const std::string& s, Cal::JitterUnits* u) {
+	if (s == "uv") *u = Cal::JitterUnits::Uv;
+	else if (s == "ndc") *u = Cal::JitterUnits::Ndc;
+	else if (s == "pixels") *u = Cal::JitterUnits::Pixels;
+	else return false;
+	return true;
+}
+nlohmann::json PathJson(const TitleProfile::Path& p) {
+	nlohmann::json j = nlohmann::json::array({p.ud});
+	for (uint32_t o: p.offs) j.push_back(o);
+	return j;
+}
+// A block of the calibration snapshot: the buffers first, then the tables (TitleProfile taa_cal_*).
+bool BlockIsBuffer(uint32_t b) {
+	return b < Prof().taa_cal_buffers.size();
+}
+const TitleProfile::Path& BlockPath(uint32_t b) {
+	const TitleProfile& P = Prof();
+	return b < P.taa_cal_buffers.size() ? P.taa_cal_buffers[b] : P.taa_cal_tables[b - P.taa_cal_buffers.size()];
+}
+constexpr size_t kCalBufferBytes = 2048, kCalTableBytes = 1024; // (2 KiB: Marvel's Wolverine's TAA reads its constants up to +1760)
+// The float at dword `d` of block (`is_buffer`, `path`) for this invocation's user data.
+bool ReadCalFloat(const uint32_t* ud, uint32_t have, bool is_buffer, const TitleProfile::Path& path, uint32_t d, float* out) {
+	if (is_buffer) {
+		uint32_t v[4] {};
+		if (!ReadPath(ud, have, path, v, 16)) return false;
+		const uint64_t base = static_cast<uint64_t>(v[0]) | (static_cast<uint64_t>(v[1] & 0xffffu) << 32u);
+		return base >= 0x10000 && TryRead(base + d * 4u, out, 4) == 4 && std::isfinite(*out);
+	}
+	uint64_t at = 0;
+	return ResolvePath(ud, have, path, &at) && TryRead(at + d * 4u, out, 4) == 4 && std::isfinite(*out);
+}
+
+void CalPersist() {
+	const std::string out = CalPath();
+	if (out.empty()) return;
+	const TitleProfile& P = Prof();
+	nlohmann::json      j;
+	j["schema"]      = "kyty-taa-calibration";
+	j["sha256"]      = P.sha256;
+	j["shader_hash"] = [&] {
+		char b[24];
+		std::snprintf(b, sizeof(b), "%016llx", static_cast<unsigned long long>(P.taa_hash));
+		return std::string(b);
+	}();
+	j["jitter"] = {{"block", g_cal.jitter_buffer ? "buffer" : "table"}, {"path", PathJson(g_cal.jitter_path)},
+	               {"dword", g_cal.jitter_dword}, {"units", UnitsName(g_cal.jitter_units)}};
+	if (g_cal.exposure_none) {
+		j["exposure"] = nullptr;
+	} else {
+		j["exposure"] = {{"block", g_cal.exposure_buffer ? "buffer" : "table"}, {"path", PathJson(g_cal.exposure_path)},
+		                 {"dword", g_cal.exposure_dword}};
+	}
+	j["motion_vectors"] = {{"sx", g_cal.mv.sx}, {"sy", g_cal.mv.sy}, {"units", UnitsName(g_cal.mv.units)}};
+	j["depth_inverted"] = g_cal.depth_inverted;
+	const std::string tmp = out + ".tmp" + std::to_string(getpid());
+	if (FILE* f = std::fopen(tmp.c_str(), "w")) {
+		const std::string text = j.dump(1) + "\n";
+		std::fwrite(text.data(), 1, text.size(), f);
+		std::fclose(f);
+		std::rename(tmp.c_str(), out.c_str());
+	}
+}
+// A calibration saved by an earlier launch of this executable and TAA shader.
+bool CalLoad() {
+	const std::string path = CalPath();
+	std::ifstream     in(path);
+	if (path.empty() || !in) return false;
+	const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+	const Json        j = Json::parse(text, nullptr, false);
+	const TitleProfile& P = Prof();
+	if (j.is_discarded() || JStr(JGet(&j, "sha256")) != P.sha256 ||
+	    std::strtoull(JStr(JGet(&j, "shader_hash")).c_str(), nullptr, 16) != P.taa_hash) {
+		return false;
+	}
+	CalResult   r;
+	const Json* ji = JGet(&j, "jitter");
+	uint64_t    d  = 0;
+	if (!JPath(JGet(ji, "path"), &r.jitter_path) || !JU64(JGet(ji, "dword"), &d) || !UnitsFrom(JStr(JGet(ji, "units")), &r.jitter_units)) {
+		return false;
+	}
+	r.jitter_dword  = static_cast<uint32_t>(d);
+	r.jitter_buffer = JStr(JGet(ji, "block")) == "buffer";
+	const Json* ex  = JGet(&j, "exposure");
+	r.exposure_none = ex == nullptr || ex->is_null();
+	if (!r.exposure_none) {
+		if (!JPath(JGet(ex, "path"), &r.exposure_path) || !JU64(JGet(ex, "dword"), &d)) return false;
+		r.exposure_dword  = static_cast<uint32_t>(d);
+		r.exposure_buffer = JStr(JGet(ex, "block")) == "buffer";
+	}
+	const Json* mv = JGet(&j, "motion_vectors");
+	if (mv == nullptr || !UnitsFrom(JStr(JGet(mv, "units")), &r.mv.units)) return false;
+	r.mv.sx            = JFloat(JGet(mv, "sx"), -1.0f) < 0 ? -1 : 1;
+	r.mv.sy            = JFloat(JGet(mv, "sy"), -1.0f) < 0 ? -1 : 1;
+	const Json* di     = JGet(&j, "depth_inverted");
+	r.depth_inverted   = di == nullptr || !di->is_boolean() || di->get<bool>();
+	g_cal              = r;
+	return true;
+}
+void CalLog(const char* how) {
+	char ex[160] = "none";
+	if (!g_cal.exposure_none) {
+		std::snprintf(ex, sizeof(ex), "{\"block\":\"%s\",\"dword\":%u}", g_cal.exposure_buffer ? "buffer" : "table", g_cal.exposure_dword);
+	}
+	LogJson("{\"event\":\"taa_calibration\",\"how\":\"%s\",\"jitter\":{\"block\":\"%s\",\"dword\":%u,\"units\":\"%s\"},"
+	        "\"exposure\":%s,\"motion_vectors\":{\"sx\":%d,\"sy\":%d,\"units\":\"%s\"},\"depth_inverted\":%d,\"frames\":%zu}",
+	        how, g_cal.jitter_buffer ? "buffer" : "table", g_cal.jitter_dword, UnitsName(g_cal.jitter_units), g_cal.exposure_none ? "null" : ex,
+	        g_cal.mv.sx, g_cal.mv.sy, UnitsName(g_cal.mv.units), g_cal.depth_inverted ? 1 : 0, g_cal_snaps.size());
+}
+
+bool Calibrating() {
+	const TitleProfile& P = Prof();
+	if (!P.taa_calibrate) return false;
+	int st = g_cal_state.load(std::memory_order_acquire);
+	if (st == 0) {
+		std::lock_guard lock(g_cal_mutex);
+		st = g_cal_state.load(std::memory_order_relaxed);
+		if (st == 0) {
+			if (CalLoad()) {
+				CalLog("loaded");
+				st = 2;
+			} else {
+				st = 1;
+				LogJson("{\"event\":\"taa_calibration\",\"how\":\"started\",\"buffers\":%zu,\"tables\":%zu}", P.taa_cal_buffers.size(),
+				        P.taa_cal_tables.size());
+			}
+			g_cal_state.store(st, std::memory_order_release);
+		}
+	}
+	return st == 1;
+}
+// Calibrated with an exposure factor (the title's TAA writes colour x exposure): HLX's output is scaled likewise.
+bool CalibratedExposure() {
+	return Prof().taa_calibrate && g_cal_state.load(std::memory_order_acquire) == 2 && !g_cal.exposure_none;
+}
+// Calibrated: HDR colour, the measured depth convention (reversed Z taken as infinite), auto exposure, dynamic res.
+bool CalibratedHlxFlags(uint32_t* flags) {
+	if (!Prof().taa_calibrate || g_cal_state.load(std::memory_order_acquire) != 2) return false;
+	*flags = 0x1u | (g_cal.depth_inverted ? 0x18u : 0u) | 0x20u | 0x40u;
+	return true;
+}
+
+// TaaCapture, while calibrating: this invocation's constants (fixed-size blocks; a frame whose reads fail is skipped).
+void CalSnapshot(uint64_t id, const uint32_t* ud, uint32_t have, uint32_t rw, uint32_t rh) {
+	const TitleProfile&             P = Prof();
+	std::vector<std::vector<float>> blocks;
+	// Fixed-size blocks; what cannot be read stays zero (a table ending before 1 KiB, a buffer smaller than 256 bytes):
+	// zeros never pass as jitter or exposure. A frame where nothing could be read is skipped.
+	bool any = false;
+	for (const auto& path: P.taa_cal_buffers) {
+		std::vector<float> b(kCalBufferBytes / 4, 0.0f);
+		uint32_t           v[4] {};
+		if (ReadPath(ud, have, path, v, 16)) {
+			const uint64_t base = static_cast<uint64_t>(v[0]) | (static_cast<uint64_t>(v[1] & 0xffffu) << 32u);
+			size_t         n    = std::min<size_t>(kCalBufferBytes, v[2] >= 16 ? v[2] : kCalBufferBytes);
+			for (; base >= 0x10000 && n >= 16; n /= 2) {
+				if (TryRead(base, b.data(), n) == n) {
+					any = true;
+					break;
+				}
+			}
+		}
+		blocks.push_back(std::move(b));
+	}
+	for (const auto& path: P.taa_cal_tables) {
+		std::vector<float> b(kCalTableBytes / 4, 0.0f);
+		uint64_t           at = 0;
+		if (ResolvePath(ud, have, path, &at)) {
+			for (size_t n = kCalTableBytes; n >= 64; n /= 2) {
+				if (TryRead(at, b.data(), n) == n) {
+					any = true;
+					break;
+				}
+			}
+		}
+		blocks.push_back(std::move(b));
+	}
+	if (!any) {
+		g_cal_snap_failures.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	std::lock_guard lock(g_cal_mutex);
+	g_cal_snaps[id] = std::move(blocks);
+	g_cal_rw        = rw;
+	g_cal_rh        = rh;
+	while (g_cal_snaps.size() > 96) g_cal_snaps.erase(g_cal_snaps.begin());
+}
+float HalfToFloat(uint16_t h) {
+	const uint32_t sign = (h >> 15u) & 1u, e = (h >> 10u) & 0x1fu, m = h & 0x3ffu;
+	float          v;
+	if (e == 0) v = std::ldexp(static_cast<float>(m), -24);
+	else if (e == 31) v = m ? NAN : INFINITY;
+	else v = std::ldexp(static_cast<float>(m | 0x400u), static_cast<int>(e) - 25);
+	return sign ? -v : v;
+}
+// With g_cal_mutex: the verdicts, once every measurement has one.
+void CalVerdict() {
+	std::vector<std::vector<std::vector<float>>> frames;
+	std::vector<double>                          ratio;
+	for (const auto& [id, snap]: g_cal_snaps) {
+		if (auto it = g_cal_ratio.find(id); it != g_cal_ratio.end()) {
+			frames.push_back(snap);
+			ratio.push_back(it->second);
+		}
+	}
+	const auto jitter   = Cal::FindJitter(frames, g_cal_rw, g_cal_rh);
+	const auto exposure = Cal::FindExposure(ratio, frames);
+	const auto vectors  = g_cal_votes.Verdict();
+	if ((g_cal_fed % 120) == 0) {
+		LogJson("{\"event\":\"taa_calibration\",\"how\":\"progress\",\"frames\":%zu,\"snapshots\":%zu,\"ratios\":%zu,\"snapshot_failures\":%llu,"
+		        "\"ratio_rejects\":%llu,\"jitter\":%d,\"exposure\":%d,\"vector_pairs\":%d,\"decisive\":%d,\"depth\":%d}",
+		        frames.size(), g_cal_snaps.size(), g_cal_ratio.size(), static_cast<unsigned long long>(g_cal_snap_failures.load()),
+		        static_cast<unsigned long long>(g_cal_ratio_rejects.load()), jitter ? 1 : 0, exposure ? 1 : 0, g_cal_votes.pairs,
+		        g_cal_votes.decisive, g_cal_depth ? 1 : 0);
+	}
+	if (frames.size() < 32 || !jitter || !exposure || !vectors || !g_cal_depth) return;
+	CalResult r;
+	r.jitter_buffer   = BlockIsBuffer(jitter->source);
+	r.jitter_path     = BlockPath(jitter->source);
+	r.jitter_dword    = jitter->dword;
+	r.jitter_units    = jitter->units;
+	r.exposure_none   = exposure->none;
+	if (!exposure->none) {
+		r.exposure_buffer = BlockIsBuffer(exposure->source);
+		r.exposure_path   = BlockPath(exposure->source);
+		r.exposure_dword  = exposure->dword;
+	}
+	r.mv             = *vectors;
+	r.depth_inverted = *g_cal_depth;
+	g_cal            = r;
+	g_cal_state.store(2, std::memory_order_release);
+	CalLog("measured");
+	std::thread(CalPersist).detach();
+}
+// The worker, as guide set `k` completes while calibrating: its luminance planes, vectors and depth.
+void CalFeed(int k) {
+	FgFrame   f;
+	CalPlanes cp;
+	{
+		std::lock_guard lock(g_fg.mutex);
+		f  = g_fg.frame[k];
+		cp = g_cal_planes[k];
+	}
+	if (!cp.valid || g_fg.buf.cpu == nullptr) return;
+	g_fg.buf.Sync(true, true);
+	const uint8_t* base  = g_fg.buf.cpu;
+	const uint32_t pitch = g_fg.pitch;
+	auto mean = [&](uint64_t off, uint32_t w, uint32_t h) {
+		const float* p = reinterpret_cast<const float*>(base + off);
+		double       s = 0;
+		size_t       n = 0;
+		for (uint32_t y = 0; y < h; y += 2) {
+			for (uint32_t x = 0; x < w; x += 2) {
+				const float v = p[static_cast<size_t>(y) * pitch + x];
+				if (std::isfinite(v) && v >= 0.0f && v < 65504.0f) {
+					s += v;
+					n++;
+				}
+			}
+		}
+		return n > 0 ? s / static_cast<double>(n) : 0.0;
+	};
+	const double in_mean = mean(cp.in_off, cp.in_w, cp.in_h), out_mean = mean(cp.out_off, cp.out_w, cp.out_h);
+	std::vector<float> luma(static_cast<size_t>(pitch) * cp.in_h);
+	std::memcpy(luma.data(), base + cp.in_off, luma.size() * 4);
+	std::vector<float> mv(static_cast<size_t>(pitch) * f.motion.height * 2);
+	{
+		const uint32_t* m = reinterpret_cast<const uint32_t*>(base + f.motion.offset);
+		for (size_t i = 0; i < static_cast<size_t>(pitch) * f.motion.height; i++) {
+			mv[i * 2]     = HalfToFloat(static_cast<uint16_t>(m[i] & 0xffffu));
+			mv[i * 2 + 1] = HalfToFloat(static_cast<uint16_t>(m[i] >> 16u));
+		}
+	}
+	std::optional<bool> depth;
+	{
+		const float* d = reinterpret_cast<const float*>(base + f.depth.offset);
+		std::vector<float> rows;
+		rows.reserve(static_cast<size_t>(f.depth.width) * f.depth.height);
+		for (uint32_t y = 0; y < f.depth.height; y++) rows.insert(rows.end(), d + static_cast<size_t>(y) * pitch, d + static_cast<size_t>(y) * pitch + f.depth.width);
+		depth = Cal::DepthInverted(rows.data(), rows.size());
+	}
+	g_fg.buf.Sync(false, true);
+	std::lock_guard lock(g_cal_mutex);
+	if (g_cal_state.load(std::memory_order_relaxed) != 1) return;
+	g_cal_fed++;
+	if (in_mean > 1e-6 && out_mean > 0.0) {
+		g_cal_ratio[f.seq] = out_mean / in_mean;
+	} else {
+		g_cal_ratio_rejects.fetch_add(1, std::memory_order_relaxed);
+	}
+	while (g_cal_ratio.size() > 96) g_cal_ratio.erase(g_cal_ratio.begin());
+	if (!g_cal_depth && depth) g_cal_depth = depth;
+	if (g_cal_prev_id != 0 && g_cal_prev_id + 1 == f.seq && g_cal_prev_luma.size() == luma.size()) {
+		g_cal_votes.Add(Cal::ScorePair(g_cal_prev_luma.data(), luma.data(), mv.data(), cp.in_w, cp.in_h, pitch, f.factor, f.render_w,
+		                               f.render_h));
+	}
+	g_cal_prev_luma = std::move(luma);
+	g_cal_prev_id   = f.seq;
+	CalVerdict();
+}
+} // namespace
+
+namespace {
 // From the worker: the boundary's EOP passed (the copies are in memory) or the boundary was abandoned.
 void FgComplete(int k, bool reached) {
+	if (reached && Calibrating()) {
+		CalFeed(k);
+		g_fg.set[k].store(0, std::memory_order_release); // (no frame generation while calibrating: the set is free again)
+		return;
+	}
 	int expect = 1;
 	g_fg.set[k].compare_exchange_strong(expect, reached ? 2 : 0);
 }
@@ -1347,6 +1798,7 @@ void Release(const Snapshot& s, bool run_unpack) {
 	const uint32_t slot = static_cast<uint32_t>(s.id % kSlots);
 	auto* flag = reinterpret_cast<volatile uint32_t*>(g_dev.control.cpu + kFlags + slot * 4u);
 	*flag      = run_unpack ? 1u : 0u;
+	*reinterpret_cast<volatile uint32_t*>(g_dev.control.cpu + kFailFlags + slot * 4u) = run_unpack ? 0u : 1u;
 	__builtin_ia32_sfence(); // the flag (write-combined) lands before the gate opens the segment that reads it
 	std::atomic_ref<uint32_t>(g_gates[slot]).store(static_cast<uint32_t>(s.id), std::memory_order_release);
 	Libs::Graphics::NativeGpu::ShadowWakeHeld();
@@ -1699,6 +2151,9 @@ void LoadSettings() {
 			}
 		}
 	}
+	if (Prof().taa_dynamic_framegen_only && g_framegen.load() == static_cast<int>(FrameGenMode::Fsr3)) {
+		g_framegen = static_cast<int>(FrameGenMode::Fsr3Dynamic);
+	}
 	if (!Prof().drs && !Prof().taa_startup_presets) { // otherwise the title keeps its own dynamic resolution
 		if (g_level.load() >= 0 || g_preset.load() != static_cast<int>(Preset::Dynamic)) {
 			LogJson("{\"event\":\"settings\",\"preset_ignored\":\"%s\",\"why\":\"render-resolution controller not mapped for this executable\"}",
@@ -2035,6 +2490,7 @@ std::string Implausible(const Snapshot& s) {
 	const uint32_t rw = s.Field<uint32_t>(0x6f8), rh = s.Field<uint32_t>(0x6fc), ow = s.Field<uint32_t>(0x700), oh = s.Field<uint32_t>(0x704);
 	const auto&    c = s.res[kColor].t;
 	const auto&    o = s.res[kOutput].t;
+	if (Prof().taa && c.Base40() == o.Base40()) return "output is its colour input (a pass in place, not a temporal resolve)";
 	if (rw == 0 || rh == 0 || rw > c.Width5() + 1u || rh > c.Height5() + 1u) return "render size outside the colour input";
 	if (ow != o.Width5() + 1u || oh != o.Height5() + 1u) return "output size differs from the output image";
 	if (ow < rw || oh < rh || ow > 8192 || oh > 8192) return "implausible output size";
@@ -2593,7 +3049,7 @@ size_t TryRead(uint64_t va, void* dst, size_t n) {
 }
 // Address of the value at the end of `path`: ud pair -> pointer loads -> final offset (48-bit addresses).
 bool ResolvePath(const uint32_t* ud, uint32_t have, const TitleProfile::Path& path, uint64_t* out) {
-	if (!path.Valid() || path.ud + 1 >= 16 || (have >> path.ud & 3u) != 3u) return false;
+	if (!path.Valid() || path.inline_ud || path.ud + 1 >= 32 || (have >> path.ud & 3u) != 3u) return false;
 	uint64_t ptr = (static_cast<uint64_t>(ud[path.ud]) | (static_cast<uint64_t>(ud[path.ud + 1]) << 32u)) & 0xffffffffffffull;
 	for (size_t i = 0; i + 1 < path.offs.size(); i++) {
 		uint32_t two[2] {};
@@ -2602,6 +3058,22 @@ bool ResolvePath(const uint32_t* ud, uint32_t have, const TitleProfile::Path& pa
 	}
 	if (ptr < 0x10000) return false;
 	*out = ptr + path.offs.back();
+	return true;
+}
+// `n` bytes at the end of `path`: through its pointer loads, or (inline path) from the user data registers themselves.
+bool ReadPath(const uint32_t* ud, uint32_t have, const TitleProfile::Path& path, void* dst, size_t n, uint64_t* where) {
+	if (path.inline_ud) {
+		const uint32_t words = static_cast<uint32_t>((n + 3) / 4);
+		if (path.ud + words > 32 || words == 0) return false;
+		const uint32_t need = ((words >= 32 ? 0xffffffffu : ((1u << words) - 1u)) << path.ud);
+		if ((have & need) != need) return false;
+		std::memcpy(dst, ud + path.ud, n);
+		if (where != nullptr) *where = 0;
+		return true;
+	}
+	uint64_t at = 0;
+	if (!ResolvePath(ud, have, path, &at) || TryRead(at, dst, n) != n) return false;
+	if (where != nullptr) *where = at;
 	return true;
 }
 // The same hash as the pass capture (nativePassCapture.cpp CodeHash): FNV-1a 64 over the first 64 code dwords.
@@ -2616,7 +3088,24 @@ std::mutex                 g_taa_mutex;
 std::map<uint64_t, bool>   g_taa_shaders; // shader address -> is the profile's TAA pass
 double                     g_taa_last = 0;
 std::atomic<uint64_t>      g_taa_busy {0}; // invocations left to the title (a guest read could not be made)
+struct RasterInputs {
+	std::array<uint32_t, 32> ud {};
+	uint32_t have = 0;
+	uint64_t output = 0;
+	bool valid = false;
+	ShaderTextureResource history {};
+};
+uint64_t g_raster_consumer = 0;
+std::map<uint64_t, ShaderTextureResource> g_raster_output_views;
+std::mutex g_raster_mutex;
+RasterInputs g_raster_inputs;
 std::shared_ptr<Snapshot>  g_composite_taa; // latest render-sized TAA inputs, under g_mutex
+// taa.output_consumer: the latest TAA capture waiting for its consumer pass, and that pass's output image (under g_mutex)
+std::shared_ptr<Snapshot>  g_consumer_taa;
+ShaderTextureResource      g_consumer_out {};
+uint64_t                   g_consumer_out_at = 0;
+bool                       g_consumer_out_valid = false;
+std::map<uint64_t, bool>   g_consumer_shaders; // under g_taa_mutex
 double                    g_composite_time = 0;
 uint64_t                  g_deferred_taa_sequence = 0;
 bool CompositeRouteWanted() {
@@ -2628,8 +3117,55 @@ void SetField(Snapshot& s, unsigned o, T v) {
 }
 } // namespace
 
+namespace {
+// Is the shader at `shader` the profile's TAA pass (its code hash, cached per address)?
+bool TaaShaderMatch(uint64_t shader) {
+	const TitleProfile& P = Prof();
+	std::lock_guard     lock(g_taa_mutex);
+	auto                it = g_taa_shaders.find(shader);
+	if (it == g_taa_shaders.end()) {
+		const uint64_t h = CodeHash64(shader);
+		if (h == 0) return false; // (unreadable now: asked again at its next dispatch)
+		it = g_taa_shaders.emplace(shader, h == P.taa_hash).first;
+		// KYTY_NATIVE_UPSCALER_LOG_SHADERS=1: every distinct compute shader the TAA match sees, with its code hash (to
+		// compare a profile's taa.shader_hash with what the title runs).
+		if (static const bool log_shaders = std::getenv("KYTY_NATIVE_UPSCALER_LOG_SHADERS") != nullptr; log_shaders) {
+			LogJson("{\"event\":\"taa_candidate\",\"address\":\"0x%llx\",\"hash\":\"0x%016llx\"}", static_cast<unsigned long long>(shader),
+			        static_cast<unsigned long long>(h));
+		}
+		if (g_taa_shaders.size() > 65536) g_taa_shaders.clear();
+		if (it->second) {
+			LogJson("{\"event\":\"taa_shader\",\"address\":\"0x%llx\",\"hash\":\"0x%016llx\"}", static_cast<unsigned long long>(shader),
+			        static_cast<unsigned long long>(h));
+		}
+	}
+	return it->second;
+}
+// Where the TAA pass runs and how often it is captured, every 5 s while it appears (diagnostic): direct dispatches on the
+// graphics / compute rings, indirect ones, captures made, captures lost to an unreadable descriptor.
+std::array<std::atomic<uint64_t>, 6> g_taa_diag {};
+std::atomic<double>                  g_taa_diag_t {0.0};
+void TaaDiagLog() {
+	const double now = MonoSec(), last = g_taa_diag_t.load(std::memory_order_relaxed);
+	if (now - last < 5.0) return;
+	double expect = last;
+	if (!g_taa_diag_t.compare_exchange_strong(expect, now)) return;
+	LogJson("{\"event\":\"taa_dispatches\",\"direct_graphics\":%llu,\"direct_compute\":%llu,\"indirect_graphics\":%llu,"
+	        "\"indirect_compute\":%llu,\"captured\":%llu,\"read_failed\":%llu}",
+	        static_cast<unsigned long long>(g_taa_diag[0].load()), static_cast<unsigned long long>(g_taa_diag[1].load()),
+	        static_cast<unsigned long long>(g_taa_diag[2].load()), static_cast<unsigned long long>(g_taa_diag[3].load()),
+	        static_cast<unsigned long long>(g_taa_diag[4].load()), static_cast<unsigned long long>(g_taa_diag[5].load()));
+}
+} // namespace
+
 bool TaaWanted() {
 	return Prof().taa;
+}
+// The translator, at a DISPATCH_INDIRECT while a TAA profile is loaded: counted only (diagnostic).
+void TaaNoteIndirect(uint64_t shader, bool compute_ring) {
+	if (!Prof().taa || !TaaShaderMatch(shader)) return;
+	g_taa_diag[compute_ring ? 3 : 2].fetch_add(1, std::memory_order_relaxed);
+	TaaDiagLog();
 }
 
 // ---- frame generation's HUD-less frame (taa.hudless): the scene the title's final composite draws its UI over ----
@@ -2637,15 +3173,26 @@ namespace {
 std::mutex               g_hl_mutex;
 std::map<uint64_t, bool> g_hl_shaders; // pixel shader address -> is the profile's UI composite
 } // namespace
+bool FgHudlessShaderMatch(uint64_t ps) {
+ if (Prof().taa_hl_hash == 0 || ps == 0 || !FgHudlessWanted()) return false;
+ std::lock_guard lock(g_hl_mutex);
+ auto it = g_hl_shaders.find(ps);
+ if (it == g_hl_shaders.end()) {
+  const auto hash = CodeHash64(ps);
+  if (hash == 0) return false;
+  it = g_hl_shaders.emplace(ps, hash == Prof().taa_hl_hash).first;
+ }
+ return it->second;
+}
 bool FgHudlessWanted() {
 	return g_fg.hl_bytes != 0 && g_fg.state.load(std::memory_order_relaxed) == 2 && FgWanted();
 }
 namespace {
-bool EmitHudless(const ShaderTextureResource& t, uint64_t id, std::vector<uint32_t>& ib, bool mirror_x);
+bool EmitHudless(const ShaderTextureResource& t, uint64_t id, std::vector<uint32_t>& ib, bool mirror_x, bool encoded = false);
 }
 bool FgHudlessDraw(uint64_t ps, const uint32_t* ud, uint32_t ud_have, std::vector<uint32_t>& ib) {
 	const TitleProfile& P = Prof();
-	if (P.taa_hl_hash == 0 || ps == 0 || !FgHudlessWanted()) return false;
+	if (P.taa_hl_replay || P.taa_hl_hash == 0 || ps == 0 || !FgHudlessWanted()) return false;
 	{
 		std::lock_guard lock(g_hl_mutex);
 		auto it = g_hl_shaders.find(ps);
@@ -2677,8 +3224,58 @@ bool FgHudlessDraw(uint64_t ps, const uint32_t* ud, uint32_t ud_have, std::vecto
 	}
 	return EmitHudless(t, id, ib, P.taa_display_mirror_x);
 }
+bool FgHudlessReplayDraw(uint64_t ps, const uint32_t* ud, uint32_t have, std::vector<uint32_t>& ib) {
+	const auto& P = Prof();
+	if (!P.taa_hl_replay || !FgHudlessShaderMatch(ps)) return false;
+	static std::atomic<unsigned> seen {0};
+	if (seen.fetch_add(1) < 3) LogJson("{\"event\":\"hudless_replay_inputs\",\"have\":%u,\"scene_format\":%u,\"ui_format\":%u}", have, (ud[1] >> 20u) & 511u, (ud[9] >> 20u) & 511u);
+	if ((have & 0xffffu) != 0xffffu) return false;
+	const uint64_t id = g_fg_translated.load(std::memory_order_acquire);
+	if (id == 0 || g_fg.hl_last.load(std::memory_order_relaxed) == id) {
+  static unsigned n=0; if(n++<3) LogJson("{\"event\":\"hudless_replay_wait\",\"boundary\":%llu,\"last\":%llu}",
+   (unsigned long long)id, (unsigned long long)g_fg.hl_last.load()); return false;
+ }
+ ShaderTextureResource scene {}, ui {};
+	std::memcpy(scene.fields, ud, 32);
+	std::memcpy(ui.fields, ud + 8, 32);
+	// During gameplay without UI the title binds a valid 1x1 black texture (type 8).
+	// Its layout is irrelevant here: the entire UI descriptor is replaced with our transparent 2D texture.
+	if (!Plain2D(scene) || ui.IsNull() || static_cast<uint32_t>(ui.Format()) != 71u ||
+	    scene.Width5() + 1u > g_fg.hl_w || scene.Height5() + 1u > g_fg.hl_h) {
+  static unsigned n=0; if(n++<3) LogJson("{\"event\":\"hudless_replay_texture_reject\",\"scene\":[%u,%u,%u,%u],\"ui\":[%u,%u,%u,%u],\"capacity\":[%u,%u]}",
+   (unsigned)scene.Type(),scene.Depth(),scene.Width5()+1u,scene.Height5()+1u,
+   (unsigned)ui.Type(),ui.Depth(),ui.Width5()+1u,ui.Height5()+1u,g_fg.hl_w,g_fg.hl_h); return false;
+ }
+	// A valid private linear texture, with transparent texels. Preserve the title's sampler and scene constants.
+	const uint64_t zero = g_dev.control.va + kTransparentUi;
+	ui.fields[0] = static_cast<uint32_t>(zero >> 8u);
+	ui.fields[1] = static_cast<uint32_t>(zero >> 40u) | (71u << 20u) | (3u << 30u);
+	ui.fields[2] = (31u >> 2u) | (31u << 14u);
+	ui.fields[3] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (9u << 28u);
+	ui.fields[4] = ui.fields[5] = ui.fields[6] = ui.fields[7] = 0;
+	ib.push_back(Pkt3(0x76, 9, false)); // SPI_SHADER_USER_DATA_PS_8..15
+	ib.push_back(0x014u);
+	ib.insert(ib.end(), ui.fields, ui.fields + 8);
+	return true;
+}
+
+bool FgHudlessReplayCopy(uint64_t display, uint32_t w, uint32_t h, uint32_t tile, std::vector<uint32_t>& ib) {
+	if (!Prof().taa_hl_replay || display == 0 || w != g_fg.hl_w || h != g_fg.hl_h || tile != 27u) {
+  static unsigned n=0; if(n++<3) LogJson("{\"event\":\"hudless_replay_copy_reject\",\"size\":[%u,%u],\"tile\":%u,\"capacity\":[%u,%u]}",w,h,tile,g_fg.hl_w,g_fg.hl_h); return false;
+ }
+	// CB format 10_10_10_2 UNORM, standard component order, single-sample render-target tile (validated by caller).
+	ShaderTextureResource t {};
+	t.fields[0] = static_cast<uint32_t>(display >> 8u);
+	t.fields[1] = static_cast<uint32_t>(display >> 40u) | (50u << 20u) | (((w - 1u) & 3u) << 30u);
+	t.fields[2] = ((w - 1u) >> 2u) | ((h - 1u) << 14u);
+	// Astro's display is A2R10G10B10: load R from bits 20..29, B from 0..9. The linear HUD-less image
+	// is A2B10G10R10, matching the presenter's channel conversion.
+	t.fields[3] = 6u | (5u << 3u) | (4u << 6u) | (7u << 9u) | (tile << 20u) | (9u << 28u);
+	return EmitHudless(t, g_fg_translated.load(std::memory_order_acquire), ib, false, true);
+}
+
 namespace {
-bool EmitHudless(const ShaderTextureResource& t, uint64_t id, std::vector<uint32_t>& ib, bool mirror_x) {
+bool EmitHudless(const ShaderTextureResource& t, uint64_t id, std::vector<uint32_t>& ib, bool mirror_x, bool encoded) {
 	if (!FgHudlessWanted() || id == 0 || g_fg.hl_last.load(std::memory_order_relaxed) == id) return false;
 	const uint32_t w = t.Width5() + 1u, h = t.Height5() + 1u;
 	if (w > g_fg.hl_w || h > g_fg.hl_h) return false;
@@ -2695,6 +3292,7 @@ bool EmitHudless(const ShaderTextureResource& t, uint64_t id, std::vector<uint32
 		p[10] = w * h;                                                          // NUM_RECORDS (pitch = width)
 		p[11] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (20u << 12u) | (1u << 24u); // 32_UINT
 		p[12] = mirror_x ? 1u : 0u;
+		p[13] = encoded ? 1u : 0u;
 	}
 	const uint64_t code = g_dev.control.va + kCodeFgHudless, tva = g_dev.control.va + tab;
 	const uint32_t rsrc1 = ((16u / 4u) - 1u) | (0xc0u << 12u) | (1u << 21u) | (1u << 30u); // 16 VGPRs wave64, denorms, DX10_CLAMP, MEM_ORDERED
@@ -2722,24 +3320,325 @@ bool EmitHudless(const ShaderTextureResource& t, uint64_t id, std::vector<uint32
 }
 } // namespace
 
-void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t ud_have) {
+// ---- a resolve with two outputs (taa.outputs): which one is displayed ---------------------------------------------
+// One of them is read back by the next invocation as its history; the other is the displayed image, the one HLX
+// writes. Until consecutive invocations have shown which, the title's resolve is not replaced.
+namespace {
+std::atomic<int> g_out_pick {-1}; // index into taa_outputs of the displayed image; -1 undecided
+std::mutex       g_out_mutex;
+uint64_t         g_out_prev[2] {};
+int              g_out_votes[2] {};
+
+bool OutputsDecided() {
+	return Prof().taa_outputs.size() != 2 || g_out_pick.load(std::memory_order_acquire) >= 0;
+}
+const TitleProfile::Path& OutputPath(const TitleProfile& P) {
+	if (P.taa_outputs.size() != 2) return P.taa_output;
+	const int k = g_out_pick.load(std::memory_order_acquire);
+	return P.taa_outputs[k < 0 ? 0 : k];
+}
+void ObserveOutputs(const TitleProfile& P, const uint32_t* ud, uint32_t have) {
+	if (P.taa_outputs.size() != 2 || P.taa_history.empty() || g_out_pick.load(std::memory_order_acquire) >= 0) return;
+	ShaderTextureResource o[2], h;
+	if (!ReadPath(ud, have, P.taa_outputs[0], o[0].fields, 32) || !ReadPath(ud, have, P.taa_outputs[1], o[1].fields, 32) ||
+	    !ReadPath(ud, have, P.taa_history[0], h.fields, 32)) {
+		return;
+	}
+	std::lock_guard lock(g_out_mutex);
+	for (int i = 0; i < 2; i++) {
+		if (g_out_prev[i] != 0 && h.Base40() == g_out_prev[i]) g_out_votes[i]++;
+	}
+	g_out_prev[0] = o[0].Base40();
+	g_out_prev[1] = o[1].Base40();
+	for (int i = 0; i < 2; i++) {
+		if (g_out_votes[i] >= 8 && g_out_votes[1 - i] == 0) {
+			g_out_pick.store(1 - i, std::memory_order_release);
+			LogJson("{\"event\":\"taa_outputs\",\"history\":%d,\"displayed\":%d,\"votes\":%d,\"displayed_va\":\"0x%llx\",\"history_va\":\"0x%llx\"}", i,
+			        1 - i, g_out_votes[i], static_cast<unsigned long long>(o[1 - i].Base40()), static_cast<unsigned long long>(o[i].Base40()));
+		}
+	}
+	static bool told = false;
+	if (!told && g_out_votes[0] >= 8 && g_out_votes[1] >= 8) {
+		told = true;
+		LogJson("{\"event\":\"taa_outputs\",\"ambiguous\":[%d,%d]}", g_out_votes[0], g_out_votes[1]);
+	}
+}
+} // namespace
+
+// ---- a TAA that reads no depth (taa.depth null): the frame's depth target ----------------------------------------
+// The translator reports the depth buffer of every draw that writes depth (NoteDepthTarget). A plain read of that
+// memory is only right when it is not HTILE-compressed, so the descriptor comes from the title: any dispatch whose
+// user data holds a 2D 32_FLOAT T# of exactly such a buffer (ASTRO BOT: its depth-of-field composite) gives the
+// descriptor, kept per buffer (double-buffered depth: one each). The TAA then takes the newest target of its colour
+// image's size and that target's descriptor.
+namespace {
+struct DepthTarget {
+	uint64_t base = 0;
+	uint32_t w = 0, h = 0, zinfo = 0;
+	uint64_t seq = 0, draws = 0;
+};
+std::mutex                                  g_dt_mutex;
+std::array<DepthTarget, 16>                 g_dt {};
+uint64_t                                    g_dt_seq = 0;
+std::map<uint64_t, ShaderTextureResource>   g_dt_tsharp; // depth buffer -> a descriptor the title samples it with
+std::atomic<uint64_t>                       g_dt_found {0}, g_dt_missing {0};
+
+// Caller holds g_dt_mutex.
+const DepthTarget* FindTarget(uint64_t base) {
+	for (const auto& t: g_dt) {
+		if (t.base == base) return &t;
+	}
+	return nullptr;
+}
+
+// Every dispatch while a depth target is wanted: a 32_FLOAT 2D descriptor in the user data that names a depth buffer.
+void DepthDonorScan(uint64_t shader, const uint32_t* ud, uint32_t have) {
+	for (uint32_t k = 0; k + 8 <= 16; k++) {
+		const uint32_t need = 0xffu << k;
+		if ((have & need) != need) continue;
+		ShaderTextureResource t;
+		std::memcpy(t.fields, ud + k, 32);
+		if (t.IsNull() || static_cast<uint32_t>(t.Format()) != 22 || t.Type() != Prospero::ImageType::kColor2D || t.BaseLevel() != 0 ||
+		    t.Depth() != 0 || t.BaseArray5() != 0) {
+			continue;
+		}
+		std::lock_guard lock(g_dt_mutex);
+		const DepthTarget* dt = FindTarget(t.Base40());
+		if (dt == nullptr || dt->w != t.Width5() + 1u || dt->h != t.Height5() + 1u) continue;
+		const bool known = g_dt_tsharp.count(t.Base40()) != 0;
+		if (!known && g_dt_tsharp.size() >= 16) g_dt_tsharp.erase(g_dt_tsharp.begin());
+		g_dt_tsharp[t.Base40()] = t;
+		if (!known) {
+			LogJson("{\"event\":\"taa_depth\",\"donor\":\"0x%016llx\",\"ud\":%u,\"base\":\"0x%llx\",\"size\":[%u,%u],\"meta_compress\":%d,"
+			        "\"z_info\":\"0x%08x\"}",
+			        static_cast<unsigned long long>(CodeHash64(shader)), k, static_cast<unsigned long long>(t.Base40()), dt->w, dt->h,
+			        t.MetaCompress() ? 1 : 0, dt->zinfo);
+		}
+	}
+}
+
+// The depth for a TAA whose colour image is `colour`: the newest depth target of that size with a title descriptor.
+bool DepthForTaa(const ShaderTextureResource& colour, ShaderTextureResource* out, uint64_t* where) {
+	const uint32_t w = colour.Width5() + 1u, h = colour.Height5() + 1u;
+	std::lock_guard lock(g_dt_mutex);
+	const DepthTarget* best = nullptr;
+	for (const auto& t: g_dt) {
+		if (t.base != 0 && t.w == w && t.h == h && (best == nullptr || t.seq > best->seq)) best = &t;
+	}
+	const auto it = best != nullptr ? g_dt_tsharp.find(best->base) : g_dt_tsharp.end();
+	const bool ok = it != g_dt_tsharp.end();
+	const uint64_t n = (ok ? g_dt_found : g_dt_missing).fetch_add(1) + 1;
+	if ((ok && (n <= 2 || n % 1800 == 0)) || (!ok && (n <= 3 || n % 600 == 0))) {
+		std::string list;
+		for (const auto& t: g_dt) {
+			if (t.base == 0) continue;
+			char e[160];
+			std::snprintf(e, sizeof(e), "%s{\"base\":\"0x%llx\",\"size\":[%u,%u],\"z_info\":\"0x%08x\",\"age\":%llu,\"draws\":%llu,\"descriptor\":%d}",
+			              list.empty() ? "" : ",", static_cast<unsigned long long>(t.base), t.w, t.h, t.zinfo,
+			              static_cast<unsigned long long>(g_dt_seq - t.seq), static_cast<unsigned long long>(t.draws),
+			              g_dt_tsharp.count(t.base) != 0 ? 1 : 0);
+			list += e;
+		}
+		LogJson("{\"event\":\"taa_depth\",\"%s\":%llu,\"colour\":[%u,%u],\"chosen\":\"0x%llx\",\"targets\":[%s]}", ok ? "found" : "missing",
+		        static_cast<unsigned long long>(n), w, h, static_cast<unsigned long long>(best != nullptr ? best->base : 0), list.c_str());
+	}
+	if (!ok) return false;
+	*out = it->second;
+	if (where != nullptr) *where = 0;
+	return true;
+}
+} // namespace
+
+bool DepthTargetWanted() {
+	return Prof().taa && Prof().taa_depth_target;
+}
+void NoteDepthTarget(uint64_t base, uint32_t w, uint32_t h, uint32_t zinfo) {
+	thread_local uint64_t last = 0;
+	thread_local uint64_t pending = 0; // draws on `last` since the lock was last taken
+	if (base == last && ++pending < 64) return;
+	std::lock_guard lock(g_dt_mutex);
+	if (base == last) {
+		for (auto& t: g_dt) {
+			if (t.base == base) t.draws += pending;
+		}
+		pending = 0;
+		return;
+	}
+	last = base;
+	pending = 0;
+	const uint64_t seq = ++g_dt_seq;
+	DepthTarget* slot = nullptr;
+	for (auto& t: g_dt) {
+		if (t.base == base) {
+			slot = &t;
+			break;
+		}
+	}
+	if (slot == nullptr) {
+		slot = &g_dt[0];
+		for (auto& t: g_dt) {
+			if (t.seq < slot->seq) slot = &t;
+		}
+		*slot = DepthTarget {};
+		slot->base = base;
+	}
+	slot->w     = w;
+	slot->h     = h;
+	slot->zinfo = zinfo;
+	slot->seq   = seq;
+	slot->draws++;
+}
+
+bool TaaBoundaryBeforeDispatch() { return Prof().taa_raster; }
+bool TaaRasterShaderMatch(uint64_t shader) { return Prof().taa_raster && TaaShaderMatch(shader); }
+
+bool TaaRasterConsumerMatch(uint64_t shader) {
+ if (!Prof().taa_raster || shader == 0) return false;
+ static std::mutex mutex;
+ static std::map<uint64_t, bool> shaders;
+ std::lock_guard lock(mutex);
+ auto it = shaders.find(shader);
+ if (it == shaders.end()) {
+  const auto h=CodeHash64(shader); if (h == 0) return false;
+  const auto& alternatives=Prof().taa_consumer_hashes;
+  it=shaders.emplace(shader,h == Prof().taa_consumer_hash || std::find(alternatives.begin(),alternatives.end(),h)!=alternatives.end()).first;
+ }
+ return it->second;
+}
+void TaaRasterCapture(uint64_t shader, const uint32_t* ud, uint32_t have, uint64_t output) {
+	if (!Prof().taa_raster || output == 0 || !TaaShaderMatch(shader)) return;
+	RasterInputs inputs;
+	std::copy(ud, ud + 32, inputs.ud.begin());
+	inputs.have = have;
+	inputs.output = output;
+	inputs.valid = true;
+	std::lock_guard lock(g_raster_mutex);
+	g_raster_inputs = inputs;
+}
+
+void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t ud_have, bool compute_ring) {
 	const TitleProfile& P = Prof();
-	if (!P.taa) return;
-	{
-		std::lock_guard lock(g_taa_mutex);
-		auto it = g_taa_shaders.find(shader);
-		if (it == g_taa_shaders.end()) {
-			const uint64_t h = CodeHash64(shader);
-			if (h == 0) return; // (unreadable now: asked again at its next dispatch)
-			it = g_taa_shaders.emplace(shader, h == P.taa_hash).first;
-			if (g_taa_shaders.size() > 65536) g_taa_shaders.clear();
-			if (it->second) {
-				LogJson("{\"event\":\"taa_shader\",\"address\":\"0x%llx\",\"hash\":\"0x%016llx\"}", static_cast<unsigned long long>(shader),
-				        static_cast<unsigned long long>(h));
+	if (P.taa && P.taa_depth_target) DepthDonorScan(shader, ud, ud_have);
+	RasterInputs raster;
+	ShaderTextureResource raster_output {};
+	if (P.taa_raster) {
+		if (compute_ring || !TaaRasterConsumerMatch(shader) || (ud_have & 0xffu) != 0xffu) return;
+		std::memcpy(raster_output.fields, ud, 32); // consumer's actual source T#, not a fabricated render-target view
+		{
+			std::lock_guard lock(g_raster_mutex);
+			g_raster_consumer = shader;
+			if (Plain2D(raster_output)) {
+				if (g_raster_output_views.size() > 16) g_raster_output_views.clear();
+				g_raster_output_views[raster_output.Base40()] = raster_output;
+			}
+			raster = g_raster_inputs;
+			g_raster_inputs.valid = false; // never reuse another frame's raster inputs
+		}
+		if (!raster.valid || raster.output != raster_output.Base40() || !Plain2D(raster_output)) return;
+		ud = raster.ud.data();
+		ud_have = raster.have;
+	} else if (!P.taa || !TaaShaderMatch(shader)) {
+		if (P.taa && P.taa_out_consumer_hash != 0 && shader != 0) {
+			bool is_consumer = false;
+			{
+				std::lock_guard lock(g_taa_mutex);
+				auto it = g_consumer_shaders.find(shader);
+				if (it == g_consumer_shaders.end()) {
+					const uint64_t h = CodeHash64(shader);
+					if (h != 0) {
+						it = g_consumer_shaders.emplace(shader, h == P.taa_out_consumer_hash).first;
+						if (it->second) LogJson("{\"event\":\"taa_output_consumer\",\"address\":\"0x%llx\"}", static_cast<unsigned long long>(shader));
+					}
+				}
+				is_consumer = it != g_consumer_shaders.end() && it->second;
+			}
+			if (is_consumer) {
+				ShaderTextureResource out {};
+				uint64_t              at = 0;
+				if (ReadPath(ud, ud_have, P.taa_out_consumer_output, out.fields, 32, &at) && Plain2D(out)) {
+					std::lock_guard lock(g_mutex);
+					g_consumer_out       = out;
+					g_consumer_out_at    = at;
+					g_consumer_out_valid = true;
+					if (g_consumer_taa != nullptr && g_consumer_taa->res[kOutput].t.Base40() == out.Base40()) {
+						auto s = g_consumer_taa;
+						g_consumer_taa.reset();
+						s->packet = packet;
+						s->shader = shader;
+						if (g_pending.size() >= 32) g_pending.pop_front();
+						g_pending.push_back(s);
+					}
+				}
+				return;
 			}
 		}
-		if (!it->second) return;
+		// KYTY_NATIVE_UPSCALER_FIND_IMAGE=0xBASE (diagnostic): every compute shader that reaches an image at that base
+		// address (user data 0..7 inline, or the table at user data 12, slots 0..352), once per shader and slot, to find
+		// the pass that writes a title's scene image (Marvel's Wolverine's temporal upscaler, 2026-11-15).
+		// KYTY_NATIVE_UPSCALER_LOG_TABLE=0xADDR (diagnostic): the images a shader at that address reaches, as the
+		// KYTY_NATIVE_UPSCALER_LOG_SHADERS table of a profile's TAA pass (first 3 dispatches, then every 2000th).
+		static const uint64_t table_at = [] {
+			const char* v = std::getenv("KYTY_NATIVE_UPSCALER_LOG_TABLE");
+			return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+		}();
+		if (static std::atomic<int> at_logs {0}; table_at != 0 && shader == table_at && [&] { const int n = at_logs.fetch_add(1); return n < 3 || (n % 2000 == 0 && n <= 20000); }()) {
+			std::string list;
+			for (int off = -1; off <= 352; off += off < 0 ? 1 : 32) {
+				TitleProfile::Path    q;
+				ShaderTextureResource t {};
+				q.ud = off < 0 ? 0u : 12u;
+				if (off < 0) q.inline_ud = true; else q.offs = {static_cast<uint32_t>(off)};
+				if (!ReadPath(ud, ud_have, q, t.fields, 32, nullptr)) continue;
+				char one[160];
+				std::snprintf(one, sizeof(one), "%s{\"slot\":%d,\"format\":%u,\"w\":%u,\"h\":%u,\"type\":%u,\"base\":\"0x%llx\"}",
+				              list.empty() ? "" : ",", off, static_cast<unsigned>(t.Format()), t.Width5() + 1u, t.Height5() + 1u,
+				              static_cast<unsigned>(t.Type()), static_cast<unsigned long long>(t.Base40()));
+				list += one;
+			}
+			LogJson("{\"event\":\"taa_table\",\"shader\":\"0x%llx\",\"hash\":\"0x%016llx\",\"images\":[%s]}", static_cast<unsigned long long>(shader),
+			        static_cast<unsigned long long>(CodeHash64(shader)), list.c_str());
+		}
+		static const uint64_t find = [] {
+			const char* v = std::getenv("KYTY_NATIVE_UPSCALER_FIND_IMAGE");
+			return v != nullptr ? std::strtoull(v, nullptr, 0) : 0ull;
+		}();
+		if (find != 0) {
+			static std::mutex                         find_mutex;
+			static std::set<std::pair<uint64_t, int>> found_pairs;
+			static std::map<uint64_t, int>            looked; // each shader's first 4 dispatches only
+			{
+				std::lock_guard lock(find_mutex);
+				if (looked.size() > 4096 || ++looked[shader] > 4) return;
+			}
+			// slot = table user-data pair * 1000 + byte offset, or -1 - n for an image held inline from user data n
+			auto check = [&](const TitleProfile::Path& q, int slot) {
+				ShaderTextureResource t {};
+				if (!ReadPath(ud, ud_have, q, t.fields, 32, nullptr) || t.Base40() != find) return;
+				std::lock_guard lock(find_mutex);
+				if (!found_pairs.emplace(shader, slot).second || found_pairs.size() > 512) return;
+				LogJson("{\"event\":\"image_user\",\"shader\":\"0x%llx\",\"hash\":\"0x%016llx\",\"slot\":%d,\"format\":%u,\"w\":%u,\"h\":%u,\"compute_ring\":%d}",
+				        static_cast<unsigned long long>(shader), static_cast<unsigned long long>(CodeHash64(shader)), slot,
+				        static_cast<unsigned>(t.Format()), t.Width5() + 1u, t.Height5() + 1u, compute_ring ? 1 : 0);
+			};
+			for (uint32_t u = 0; u + 8 <= 16; u += 4) {
+				TitleProfile::Path q;
+				q.ud = u;
+				q.inline_ud = true;
+				check(q, -1 - static_cast<int>(u));
+			}
+			for (uint32_t u = 0; u + 1 < 16; u += 2) {
+				for (uint32_t off = 0; off <= 512; off += 32) {
+					TitleProfile::Path q;
+					q.ud   = u;
+					q.offs = {off};
+					check(q, static_cast<int>(u * 1000u + off));
+				}
+			}
+		}
+		return;
 	}
+	g_taa_diag[compute_ring ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+	TaaDiagLog();
 	static std::once_flag found;
 	std::call_once(found, [&] {
 		LogJson("{\"event\":\"fingerprint\",\"ok\":1,\"profile\":\"%s\",\"taa_shader\":\"0x%016llx\"}", P.title.c_str(),
@@ -2747,14 +3646,42 @@ void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t u
 		EnsureTaaSettings();
 		g_title_state = 1;
 	});
+	// KYTY_NATIVE_UPSCALER_LOG_SHADERS=1: the first captures list every image the pass reaches (its user data 0..7 inline,
+	// and the table at user data 12, slots 0..352), to assign a static route's roles (colour, depth, motion) from the data.
+	if (static std::atomic<int> table_logs {0}; std::getenv("KYTY_NATIVE_UPSCALER_LOG_SHADERS") != nullptr && [&] { const int n = table_logs.fetch_add(1); return n < 3 || (n % 2000 == 0 && n <= 20000); }()) {
+		std::string list;
+		for (int off = -1; off <= 352; off += off < 0 ? 1 : 32) {
+			TitleProfile::Path    q;
+			ShaderTextureResource t {};
+			q.ud = off < 0 ? 0u : 12u;
+			if (off < 0) q.inline_ud = true; else q.offs = {static_cast<uint32_t>(off)};
+			uint64_t at = 0;
+			if (!ReadPath(ud, ud_have, q, t.fields, 32, &at)) continue;
+			char one[160];
+			std::snprintf(one, sizeof(one), "%s{\"slot\":%d,\"format\":%u,\"w\":%u,\"h\":%u,\"type\":%u,\"base\":\"0x%llx\"}",
+			              list.empty() ? "" : ",", off, static_cast<unsigned>(t.Format()), t.Width5() + 1u, t.Height5() + 1u,
+			              static_cast<unsigned>(t.Type()), static_cast<unsigned long long>(t.Base40()));
+			list += one;
+		}
+		LogJson("{\"event\":\"taa_table\",\"shader\":\"0x%llx\",\"images\":[%s]}", static_cast<unsigned long long>(shader), list.c_str());
+	}
 	Snapshot                   s {};
-	const TitleProfile::Path*  paths[4] = {&P.taa_color, &P.taa_depth, &P.taa_motion, &P.taa_output};
+	if (P.taa_raster && !raster.history.IsNull()) {
+		s.raster_history.t = raster.history;
+		s.raster_history.present = true;
+	}
+	ObserveOutputs(P, ud, ud_have);
+	const TitleProfile::Path*  paths[4] = {&P.taa_color, &P.taa_depth, &P.taa_motion, &OutputPath(P)};
 	const unsigned             slot[4]  = {kColor, kDepth, kMotion, kOutput};
 	for (unsigned k = 0; k < 4; k++) {
 		uint64_t at = 0;
 		auto&    r  = s.res[slot[k]];
-		if (!ResolvePath(ud, ud_have, *paths[k], &at) || TryRead(at, r.t.fields, 32) != 32) {
+		const bool read = P.taa_raster && slot[k] == kOutput ? (r.t = raster_output, true)
+		                  : slot[k] == kDepth && P.taa_depth_target ? DepthForTaa(s.res[kColor].t, &r.t, &at)
+		                                                          : ReadPath(ud, ud_have, *paths[k], r.t.fields, 32, &at);
+		if (!read) {
 			g_taa_busy.fetch_add(1);
+			g_taa_diag[5].fetch_add(1, std::memory_order_relaxed);
 			return;
 		}
 		r.handle  = at;
@@ -2767,6 +3694,13 @@ void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t u
 			return;
 		}
 	}
+	if (P.taa_out_consumer_hash != 0) {
+		// The scene image the consumer pass writes is this TAA's output (known once that pass ran once).
+		std::lock_guard lock(g_mutex);
+		if (!g_consumer_out_valid) return;
+		s.res[kOutput].t      = g_consumer_out;
+		s.res[kOutput].handle = g_consumer_out_at;
+	}
 	float    jitter[2] {};
 	uint64_t ja = 0;
 	if (!ResolvePath(ud, ud_have, P.taa_jitter, &ja) || TryRead(ja, jitter, 8) != 8 || !std::isfinite(jitter[0]) || !std::isfinite(jitter[1])) {
@@ -2778,6 +3712,13 @@ void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t u
 	auto size_at = [&](const TitleProfile::Path& path, uint32_t* w, uint32_t* h) {
 		float    v[2] {};
 		uint64_t a = 0;
+		if (P.taa_sizes_integer && path.Valid() && ResolvePath(ud, ud_have, path, &a)) {
+			uint32_t size[2] {};
+			if (TryRead(a, size, sizeof(size)) == sizeof(size) && size[0] >= 64 && size[1] >= 64 && size[0] <= *w && size[1] <= *h) {
+				*w = size[0]; *h = size[1];
+			}
+			return;
+		}
 		if (path.Valid() && ResolvePath(ud, ud_have, path, &a) && TryRead(a, v, 8) == 8 && std::isfinite(v[0]) && std::isfinite(v[1]) &&
 		    v[0] >= 64.0f && v[1] >= 64.0f && v[0] <= static_cast<float>(*w) && v[1] <= static_cast<float>(*h)) {
 			*w = static_cast<uint32_t>(v[0] + 0.5f);
@@ -2805,10 +3746,39 @@ void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t u
 		dt         = g_taa_last == 0 ? 0 : now - g_taa_last;
 		g_taa_last = now;
 	}
-	SetField<float>(s, 0x6e8, jitter[0] * (P.taa_jitter_uv ? static_cast<float>(rw) : 1.0f) * P.taa_jitter_sign[0]);
-	SetField<float>(s, 0x6ec, jitter[1] * (P.taa_jitter_uv ? static_cast<float>(rh) : 1.0f) * P.taa_jitter_sign[1]);
-	SetField<float>(s, 0x6f0, P.taa_mv_sign * static_cast<float>(rw));
-	SetField<float>(s, 0x6f4, P.taa_mv_sign * static_cast<float>(rh));
+	float jx = jitter[0] * (P.taa_jitter_uv ? static_cast<float>(rw) : 1.0f) * P.taa_jitter_sign[0];
+	float jy = jitter[1] * (P.taa_jitter_uv ? static_cast<float>(rh) : 1.0f) * P.taa_jitter_sign[1];
+	float mvx = P.taa_mv_sign * static_cast<float>(rw), mvy = P.taa_mv_sign * static_cast<float>(rh);
+	// A statically discovered TAA: what its calibration found (until then the title's TAA is not replaced, and
+	// these stay neutral: no jitter, no exposure).
+	const bool calibrated = P.taa_calibrate && g_cal_state.load(std::memory_order_acquire) == 2;
+	if (P.taa_calibrate) {
+		jx = jy = 0.0f;
+		scale   = 1.0f;
+	}
+	if (calibrated) {
+		float j[2] {};
+		if (ReadCalFloat(ud, ud_have, g_cal.jitter_buffer, g_cal.jitter_path, g_cal.jitter_dword, &j[0]) &&
+		    ReadCalFloat(ud, ud_have, g_cal.jitter_buffer, g_cal.jitter_path, g_cal.jitter_dword + 1u, &j[1])) {
+			const float ux = g_cal.jitter_units == Cal::JitterUnits::Uv ? static_cast<float>(rw)
+			                 : g_cal.jitter_units == Cal::JitterUnits::Ndc ? 0.5f * static_cast<float>(rw) : 1.0f;
+			const float uy = g_cal.jitter_units == Cal::JitterUnits::Uv ? static_cast<float>(rh)
+			                 : g_cal.jitter_units == Cal::JitterUnits::Ndc ? 0.5f * static_cast<float>(rh) : 1.0f;
+			jx = j[0] * ux;
+			jy = j[1] * uy;
+		}
+		mvx = static_cast<float>(g_cal.mv.sx * g_cal.mv.Ux(rw));
+		mvy = static_cast<float>(g_cal.mv.sy * g_cal.mv.Uy(rh));
+		float e = 0;
+		if (!g_cal.exposure_none && ReadCalFloat(ud, ud_have, g_cal.exposure_buffer, g_cal.exposure_path, g_cal.exposure_dword, &e) &&
+		    e > 0.0f && e < 1e6f) {
+			scale = e;
+		}
+	}
+	SetField<float>(s, 0x6e8, jx);
+	SetField<float>(s, 0x6ec, jy);
+	SetField<float>(s, 0x6f0, mvx);
+	SetField<float>(s, 0x6f4, mvy);
 	SetField<uint32_t>(s, 0x6f8, rw);
 	SetField<uint32_t>(s, 0x6fc, rh);
 	SetField<uint32_t>(s, 0x700, ow);
@@ -2836,21 +3806,63 @@ void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t u
 	s.id          = CompositeRouteWanted() ? ++g_deferred_taa_sequence : ++g_sequence;
 	s.packet      = packet;
 	s.shader      = shader;
+	g_taa_diag[4].fetch_add(1, std::memory_order_relaxed);
+	if (Calibrating()) {
+		CalSnapshot(s.id, ud, ud_have, rw, rh); // (the same id its guide set gets: FgEmit's seq)
+	}
 	NoteInvocation(s);
 	if (CompositeRouteWanted() && rw == s.res[kOutput].t.Width5() + 1u && rh == s.res[kOutput].t.Height5() + 1u) {
 		g_composite_taa = std::make_shared<Snapshot>(s);
 	}
 	if (s.id <= 3 || s.id % 600 == 0) {
-		LogJson("{\"event\":\"taa_capture\",\"invocation\":%llu,\"render\":[%u,%u],\"output\":[%u,%u],\"color_capacity\":[%u,%u],\"output_capacity\":[%u,%u],\"jitter_px\":[%.4f,%.4f],\"scale\":%.5g,"
+		LogJson("{\"event\":\"taa_capture\",\"ring\":\"%s\",\"invocation\":%llu,\"render\":[%u,%u],\"output\":[%u,%u],\"color_capacity\":[%u,%u],\"output_capacity\":[%u,%u],\"jitter_px\":[%.4f,%.4f],\"scale\":%.5g,"
 		        "\"color\":\"0x%llx\",\"depth\":\"0x%llx\",\"motion\":\"0x%llx\",\"output_va\":\"0x%llx\",\"busy\":%llu}",
-		        static_cast<unsigned long long>(s.id), rw, rh, ow, oh, s.res[kColor].t.Width5() + 1u, s.res[kColor].t.Height5() + 1u,
+		        compute_ring ? "compute" : "graphics", static_cast<unsigned long long>(s.id), rw, rh, ow, oh, s.res[kColor].t.Width5() + 1u,
+		        s.res[kColor].t.Height5() + 1u,
 		        s.res[kOutput].t.Width5() + 1u, s.res[kOutput].t.Height5() + 1u, s.Field<float>(0x6e8), s.Field<float>(0x6ec), scale,
 		        static_cast<unsigned long long>(s.res[kColor].t.Base40()), static_cast<unsigned long long>(s.res[kDepth].t.Base40()),
 		        static_cast<unsigned long long>(s.res[kMotion].t.Base40()), static_cast<unsigned long long>(s.res[kOutput].t.Base40()),
 		        static_cast<unsigned long long>(g_taa_busy.load()));
 	}
+	if (P.taa_out_consumer_hash != 0) {
+		g_consumer_taa = std::make_shared<Snapshot>(s); // taken at the consumer pass (TaaCapture's consumer branch)
+		return;
+	}
 	if (g_pending.size() >= 32) g_pending.pop_front();
 	g_pending.push_back(std::make_shared<Snapshot>(s));
+}
+
+bool TakeRasterBoundary(uint64_t packet, uint64_t ps, const uint32_t* ud, uint32_t have,
+                        uint64_t output, uint64_t history, uint32_t w, uint32_t h, Boundary* boundary) {
+	if (!Prof().taa_raster || !TaaShaderMatch(ps) || GetMode() != Mode::Hlx || !RuntimeVerified() ||
+	    g_dev.state.load(std::memory_order_acquire) != 2 || !g_hlx_healthy.load() || (have & 0xffffu) != 0xffffu) return false;
+	ShaderTextureResource view {}, history_view {};
+	uint64_t consumer = 0;
+	std::memcpy(history_view.fields, ud + 8, 32);
+	if (!Plain2D(history_view) || static_cast<uint32_t>(history_view.Format()) != 71u || history_view.MetaCompress() ||
+	    history_view.WriteCompress() || history == 0 || history_view.Width5() + 1u != w || history_view.Height5() + 1u != h) return false;
+	{
+		std::lock_guard lock(g_raster_mutex);
+		const auto it = g_raster_output_views.find(output);
+		if (it == g_raster_output_views.end() || it->second.Width5() + 1u != w || it->second.Height5() + 1u != h ||
+		    !g_raster_inputs.valid || g_raster_inputs.output != output) return false;
+		view = it->second;
+		consumer = g_raster_consumer;
+		// The same uncompressed history allocation/layout, at this draw's actual alternating MRT address.
+		history_view.fields[0] = static_cast<uint32_t>(history >> 8u);
+		history_view.fields[1] = (history_view.fields[1] & ~0xffu) | static_cast<uint32_t>((history >> 40u) & 0xffu);
+		g_raster_inputs.history = history_view;
+	}
+	uint32_t consumer_ud[16] {};
+	std::memcpy(consumer_ud, view.fields, 32);
+	TaaCapture(packet, consumer, consumer_ud, 0xffu, false);
+	if (!TakeBoundary(packet, consumer, false, boundary)) return false;
+	boundary->skip_dispatch = boundary->gate != 0; // guides-only boundaries still run the title's draw
+	if (!boundary->skip_dispatch) return true;
+	static std::atomic<unsigned> replacements {0};
+	if (replacements.fetch_add(1) % 600 == 0) LogJson("{\"event\":\"raster_taa_replaced\",\"invocation\":%llu}",
+	    static_cast<unsigned long long>(boundary->id));
+	return true;
 }
 
 namespace {
@@ -2930,6 +3942,11 @@ bool SkipFsr3Dispatch(uint64_t packet) {
 		return false;
 	}
 	std::lock_guard guard(g_mutex);
+	// taa.output_consumer: the title's TAA, just captured, whose result HLX replaces at the consumer pass: when HLX takes
+	// this frame, the resolve's own work is not needed (its output and history go unread until HLX stops).
+	if (Prof().taa_out_consumer_hash != 0 && g_consumer_taa != nullptr && g_consumer_taa->packet == packet) {
+		return SkipWanted() && !Calibrating() && Decide(*g_consumer_taa);
+	}
 	for (auto& s: g_pending) {
 		for (unsigned j = 0; j < 3; j++) {
 			if (s->job_packets[j] == packet) {
@@ -2981,8 +3998,13 @@ bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary*
 		return true;
 	}
 	// The title's own FSR3 (Mode::Off) inserts nothing unless frame generation wants this frame's guides.
-	const bool fg      = FgWanted() && RuntimeVerified() && FgReady(*s) && g_dev.control.cpu != nullptr;
-	const bool upscale = mode == Mode::Off ? false : mode == Mode::Hlx ? Decide(*s) : (DeviceReady(*s) && ActiveWindow());
+	// (a statically discovered TAA still calibrating: guide and luminance planes only; the title's TAA stays)
+	const bool calibrating = Calibrating();
+	const bool fg      = FgGuidesWanted() && RuntimeVerified() && FgReady(*s) && g_dev.control.cpu != nullptr;
+	// (and, for a resolve with two outputs, until the displayed one is known)
+	const bool upscale = calibrating || !OutputsDecided() || mode == Mode::Off ? false
+	                     : mode == Mode::Hlx                                    ? Decide(*s)
+	                                                                            : (DeviceReady(*s) && ActiveWindow());
 	if (!upscale && PoolBlocksFsr3()) {
 		// FSR3's working memory is released (or moving back): its accumulate pass must not run. Nothing is inserted
 		// but the pass's removal (and the guide copies when frame generation wants them).
@@ -3026,7 +4048,8 @@ bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary*
 		const auto& r = g_dev.region[i];
 		const auto& t = s->res[i].t;
 		return s->res[i].present && Plain2D(t) && r.bytes != 0 && s->dims[i][0] <= r.w && s->dims[i][1] <= r.h &&
-		       static_cast<uint32_t>(t.Format()) == r.format;
+		       (static_cast<uint32_t>(t.Format()) == r.format ||
+		        (Prof().taa_raster && i == kMotion && static_cast<uint32_t>(t.Format()) == 71u && r.format == 29u));
 	};
 	static constexpr unsigned kPack[] = {kColor, kDepth, kMotion, kReactive, kComposition, kOutput, kDilatedMotion, kDilatedDepth};
 	const uint32_t        slot    = static_cast<uint32_t>(s->id % kSlots);
@@ -3069,7 +4092,9 @@ bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary*
 		}
 		// HLX's output at another size than the title's (the output resolution setting): scaled into it.
 		const auto& out_r  = g_dev.region[kOutput];
-		const bool  scaled = out_r.w != s->dims[kOutput][0] || out_r.h != s->dims[kOutput][1];
+		// A larger allocation is capacity, not an upscale request. HLX dispatches only the active output
+		// rectangle when a raster title changes it between scenes.
+		const bool  scaled = out_r.w < s->dims[kOutput][0] || out_r.h < s->dims[kOutput][1];
 		if (scaled ? !(s->res[kOutput].present && Plain2D(s->res[kOutput].t) && out_r.bytes != 0 && out_r.format == 71 &&
 		               static_cast<uint32_t>(s->res[kOutput].t.Format()) == 71 && out_r.w < s->dims[kOutput][0] &&
 		               out_r.h < s->dims[kOutput][1] && table + 7 <= kTablesPerSlot)
@@ -3097,7 +4122,7 @@ bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary*
 			return true;
 		}
 		const uint64_t t          = kTables + (slot * kTablesPerSlot + table) * 64u;
-		const bool     taa_scaled = !scaled && Prof().taa && Prof().taa_scale.Valid();
+		const bool     taa_scaled = !scaled && Prof().taa && (Prof().taa_raster || Prof().taa_scale.Valid() || CalibratedExposure());
 		table += scaled || taa_scaled ? 2 : 1;
 		std::vector<uint32_t> d;
 		if (taa_scaled) { // HLX's output x the TAA's exposure (the colour HLX saw is before it), alpha 1
@@ -3114,6 +4139,22 @@ bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary*
 			WriteCopyTable(t, g_dev.hlx[kOutput], s->res[kOutput].t);
 			EmitDispatch(d, kCodeCopy4A0, t, out_r, s->dims[kOutput][0], s->dims[kOutput][1], compute_ring);
 		}
+		if (s->raster_history.present && table < kTablesPerSlot) {
+			const uint64_t ht = kTables + (slot * kTablesPerSlot + table++) * 64u;
+			WriteCopyTable(ht, g_dev.hlx[kOutput], s->raster_history.t);
+			EmitDispatch(d, kCodeCopy4A1, ht, out_r, s->dims[kOutput][0], s->dims[kOutput][1], compute_ring);
+			// If the helper fails after the draw was replaced, provide a current spatial frame. The next frame
+			// resumes the original TAA; its history was kept current by the successful HLX writes above.
+			const uint64_t fallback = kPassthroughTables + slot * 128u;
+			WriteScaleTable(fallback, s->res[kColor].t, rw, rh, s->res[kOutput].t, s->dims[kOutput][0], s->dims[kOutput][1]);
+			std::vector<uint32_t> spatial;
+			EmitDispatch(spatial, kCodeScale4A0, fallback, out_r, s->dims[kOutput][0], s->dims[kOutput][1], compute_ring, 64);
+			const uint64_t failed = g_dev.control.va + kFailFlags + slot * 4u;
+			*reinterpret_cast<volatile uint32_t*>(g_dev.control.cpu + kFailFlags + slot * 4u) = 1u;
+			out->after.insert(out->after.end(), {Pkt3(0x22, 4, compute_ring), static_cast<uint32_t>(failed),
+			    static_cast<uint32_t>(failed >> 32u), 0u, static_cast<uint32_t>(spatial.size())});
+			out->after.insert(out->after.end(), spatial.begin(), spatial.end());
+		}
 		const uint64_t flag = g_dev.control.va + kFlags + slot * 4u;
 		*reinterpret_cast<volatile uint32_t*>(g_dev.control.cpu + kFlags + slot * 4u) = 0u;
 		out->after.push_back(Pkt3(0x22, 4, compute_ring)); // COND_EXEC: skip the unpack unless HLX finished
@@ -3122,7 +4163,7 @@ bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary*
 		out->after.push_back(0u);
 		out->after.push_back(static_cast<uint32_t>(d.size()));
 		out->after.insert(out->after.end(), d.begin(), d.end());
-		out->skip_dispatch = SkipWanted();
+		out->skip_dispatch = !Prof().taa_raster && SkipWanted();
 		g_inflight[s->id] = s;
 		StartWorker();
 		return true;
@@ -3260,6 +4301,9 @@ FrameGenMode FrameGen() {
 }
 uint32_t FgDepthFlags() {
 	const TitleProfile& P = Prof();
+	if (uint32_t f = 0; CalibratedHlxFlags(&f)) {
+		return ((f & 0x8u) != 0 ? 1u : 0u) | ((f & 0x10u) != 0 ? 2u : 0u);
+	}
 	if (P.taa && P.taa_hlx_flags != 0) { // FSR upscale flags: 0x8 depth inverted, 0x10 depth infinite
 		return ((P.taa_hlx_flags & 0x8u) != 0 ? 1u : 0u) | ((P.taa_hlx_flags & 0x10u) != 0 ? 2u : 0u);
 	}
@@ -3267,6 +4311,7 @@ uint32_t FgDepthFlags() {
 }
 void SetFrameGen(FrameGenMode m) {
 	if (!TitleSupported()) return;
+	if (Prof().taa_dynamic_framegen_only && m == FrameGenMode::Fsr3) m = FrameGenMode::Fsr3Dynamic;
 	g_auto_framegen.store(0); // (the menu's choice replaces a pending automatic start)
 	g_fg_changes.fetch_add(1);
 	const MemState ms     = ReadMemState(m != FrameGenMode::Off);
@@ -3589,7 +4634,17 @@ void CaptureHost(uint64_t, uint64_t, uint64_t) {}
 bool TaaWanted() {
 	return false;
 }
-void TaaCapture(uint64_t, uint64_t, const uint32_t*, uint32_t) {}
+void TaaCapture(uint64_t, uint64_t, const uint32_t*, uint32_t, bool) {}
+void TaaNoteIndirect(uint64_t, bool) {}
+bool TaaRasterConsumerMatch(uint64_t) { return false; }
+void TaaRasterCapture(uint64_t, const uint32_t*, uint32_t, uint64_t) {}
+bool TaaBoundaryBeforeDispatch() { return false; }
+bool TaaRasterShaderMatch(uint64_t) { return false; }
+bool TakeRasterBoundary(uint64_t, uint64_t, const uint32_t*, uint32_t, uint64_t, uint64_t, uint32_t, uint32_t, Boundary*) { return false; }
+bool DepthTargetWanted() {
+	return false;
+}
+void NoteDepthTarget(uint64_t, uint32_t, uint32_t, uint32_t) {}
 bool TakeBoundary(uint64_t, uint64_t, bool, Boundary*) {
 	return false;
 }
@@ -3658,6 +4713,9 @@ void FgAddDisplayBuffer(uint64_t, uint64_t) {}
 bool FgHudlessWanted() {
 	return false;
 }
+bool FgHudlessShaderMatch(uint64_t) { return false; }
+bool FgHudlessReplayDraw(uint64_t, const uint32_t*, uint32_t, std::vector<uint32_t>&) { return false; }
+bool FgHudlessReplayCopy(uint64_t, uint32_t, uint32_t, uint32_t, std::vector<uint32_t>&) { return false; }
 bool FgHudlessDraw(uint64_t, const uint32_t*, uint32_t, std::vector<uint32_t>&) {
 	return false;
 }

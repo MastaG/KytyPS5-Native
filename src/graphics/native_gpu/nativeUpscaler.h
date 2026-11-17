@@ -73,7 +73,22 @@ bool TaaWanted();
 // From the translator at a DISPATCH_DIRECT (gfx ring), before TakeBoundary: `packet` its guest address, `shader` the
 // compute program, `ud` COMPUTE_USER_DATA_0..15 (bit i of `ud_have`: register i was written). When the shader is the
 // profile's TAA pass, its inputs are read through the profile's paths and queued for TakeBoundary.
-void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t ud_have);
+void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t ud_have, bool compute_ring = false);
+// The translator, at a DISPATCH_INDIRECT while a TAA profile is loaded: counted for the diagnostic (not captured).
+void TaaNoteIndirect(uint64_t shader, bool compute_ring);
+// Raster TAA input capture. The matching consumer's boundary executes before its dispatch.
+void TaaRasterCapture(uint64_t shader, const uint32_t* ud, uint32_t have, uint64_t output);
+bool TaaBoundaryBeforeDispatch();
+bool TaaRasterShaderMatch(uint64_t shader);
+bool TaaRasterConsumerMatch(uint64_t shader);
+// Replace a raster resolve before its draw, using a descriptor observed at its actual consumer. Until that
+// descriptor is available (or whenever its layout changes), the original draw and consumer route remain active.
+bool TakeRasterBoundary(uint64_t packet, uint64_t ps, const uint32_t* ud, uint32_t have,
+                        uint64_t output, uint64_t history, uint32_t w, uint32_t h, Boundary* boundary);
+// A TAA that reads no depth (taa.depth null): the translator reports each draw's depth target (DB_Z_WRITE_BASE,
+// DB_DEPTH_SIZE_XY, DB_Z_INFO) while depth writes are on; the TAA takes the latest one of its size.
+bool DepthTargetWanted();
+void NoteDepthTarget(uint64_t base, uint32_t w, uint32_t h, uint32_t z_info);
 // From the translator at a DISPATCH_DIRECT: true when it is a verified accumulate boundary.
 bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary* out);
 // Startup TAA presets: upscale the post-processed scene at its final UI composite.
@@ -138,11 +153,16 @@ struct FgFrame {
 // The translator, before each draw into a display buffer: whether FgHudlessDraw wants to see it (frame generation on,
 // a HUD-less composite in the profile, its buffer allocated).
 bool FgHudlessWanted();
+bool FgHudlessShaderMatch(uint64_t shader);
 // The translator, at a draw into a display buffer on the graphics ring, with the pixel shader's address and user data:
 // when it is the profile's UI composite, the dispatch saving this frame's HUD-less scene into `ib` (it writes the
 // compute SH registers kTouchedSh; the caller puts the title's back, after a barrier that writes GL2 back). True when
 // emitted.
 bool FgHudlessDraw(uint64_t ps, const uint32_t* ud, uint32_t ud_have, std::vector<uint32_t>& ib);
+// Exact raster HUD-less frame: the original composite draws once with transparent UI, its display pixels are
+// copied on GPU, then the original draw runs with its UI restored. Translator supplies producer/consumer barriers.
+bool FgHudlessReplayDraw(uint64_t ps, const uint32_t* ud, uint32_t have, std::vector<uint32_t>& ib);
+bool FgHudlessReplayCopy(uint64_t display, uint32_t w, uint32_t h, uint32_t tile, std::vector<uint32_t>& ib);
 // Presenter thread: the guide buffer once allocated (a new DMA-BUF fd the caller owns), else -1.
 int  FgBufferFd(uint64_t* size, uint64_t* generation);
 // Presenter, at a flip: the set of boundary `want` (the boundary that flip follows, FgFlipBoundary), held until
