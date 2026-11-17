@@ -1,0 +1,722 @@
+{
+ "schema": "kyty-upscaler-profile",
+ "schema_version": 2,
+ "scanner_version": "1.2.0",
+ "scanned_at": "2026-11-15T13:49:50+00:00",
+ "game_executed": false,
+ "gpu_used": false,
+ "game": {
+  "title_id": "PPSA03671",
+  "version": "01.001.005",
+  "name": "Marvel's Wolverine",
+  "sha256": "3f15c99ec93aaf827b2d0338ee730400be12ebc7c20ebfe76773597d015f5497",
+  "executable_bytes": "0xb7798fa",
+  "location": {
+   "archive": "/home/david/Downloads/PPSA03671/PPSA03671.zar",
+   "member": "PPSA03671-app/eboot.bin"
+  },
+  "stamp": "111528614602|1794524532401573393",
+  "attribute3": "0x8441044",
+  "ps5_pro_enhanced": true
+ },
+ "imports": {
+  "count": 931,
+  "libraries": [
+   "libSceAcm",
+   "libSceAgc",
+   "libSceAgcDriver",
+   "libSceAjm",
+   "libSceAmpr",
+   "libSceAppContent",
+   "libSceAudioOut2",
+   "libSceCommonDialog",
+   "libSceCoredump",
+   "libSceFiber",
+   "libSceHttp",
+   "libSceHttp2",
+   "libSceImeDialog",
+   "libSceJson2",
+   "libSceNet",
+   "libSceNetCtl",
+   "libSceNpCommerce",
+   "libSceNpCppWebApi",
+   "libSceNpEntitlementAccess",
+   "libSceNpGameIntent",
+   "libSceNpManager",
+   "libSceNpSessionSignaling",
+   "libSceNpTrophy2",
+   "libSceNpUniversalDataSystem",
+   "libSceNpWebApi2",
+   "libScePad",
+   "libScePlayGo",
+   "libScePlayGoDialog",
+   "libScePlayerInvitationDialog",
+   "libScePngEnc",
+   "libScePosix",
+   "libScePsml_mfsr2",
+   "libSceRtc",
+   "libSceSaveDataDialog.native",
+   "libSceSaveData_native",
+   "libSceSsl",
+   "libSceSysmodule",
+   "libSceSystemService",
+   "libSceUserService",
+   "libSceUserServicePlatformPrivacyWs1",
+   "libSceVideoOut",
+   "libSceVideoOutVrrStatus",
+   "libc",
+   "libcohtml.Prospero",
+   "libkernel"
+  ]
+ },
+ "psml": {
+  "libraries": [
+   "libScePsml_mfsr2"
+  ],
+  "other_imports": {},
+  "unknown_imports": [
+   "1ic5q-kdOsc",
+   "5z2gBlqxJ+0",
+   "ZLL31lzzxr4",
+   "gMduXCLYrNg",
+   "m9JLPc3wOQw",
+   "o+NM86gEwFE"
+  ]
+ },
+ "fidelityfx": {
+  "components": {},
+  "frame_interpolation_in_game": false
+ },
+ "routes": [
+  {
+   "family": "psml",
+   "abi": "psml_mfsr2",
+   "abi_source": "AnyPS5 reverse-engineered Api.hpp via the Stage 2 registry (no real dispatch captured yet)",
+   "entry": {
+    "kind": "import",
+    "nid": "lrJwpLjKXRc",
+    "library": "libScePsml_mfsr2",
+    "module": "libScePsml",
+    "got_rva": "0x980c228",
+    "plt_rvas": [
+     "0x5f21e70"
+    ]
+   },
+   "runtime_hook": "kyty_hle_import",
+   "mode_requirement": "ps5_pro",
+   "callsites": [
+    {
+     "chain": [
+      {
+       "function_rva": "0x8e0",
+       "call_rva": "0x98a",
+       "callee_rva": "0x5f21e70",
+       "passes": "rdx"
+      },
+      {
+       "function_rva": "0x3ec4720",
+       "call_rva": "0x3ec514c",
+       "callee_rva": "0x8e0"
+      }
+     ],
+     "game_function_rva": "0x3ec4720",
+     "game_call_rva": "0x3ec514c",
+     "parameter_value": "address",
+     "parameter_block": {
+      "kind": "stack",
+      "frame_register": "rbp",
+      "frame_offset": "-0x7e0",
+      "function_rva": "0x3ec4720",
+      "frame_offset_hex": "-0x7e0"
+     },
+     "resources": {
+      "output": {
+       "slot": 0,
+       "parameter_offset": "0x0",
+       "store_rvas": [
+        "0x3ec50c2"
+       ],
+       "stored_from_register": true,
+       "source": "rax"
+      },
+      "color": {
+       "slot": 1,
+       "parameter_offset": "0x8",
+       "store_rvas": [
+        "0x3ec50d4"
+       ],
+       "stored_from_register": true,
+       "source": "rax"
+      },
+      "motion_vectors": {
+       "slot": 2,
+       "parameter_offset": "0x10",
+       "store_rvas": [
+        "0x3ec50ed"
+       ],
+       "stored_from_register": true,
+       "source": "rax"
+      },
+      "depth": {
+       "slot": 3,
+       "parameter_offset": "0x18",
+       "store_rvas": [
+        "0x3ec50ff"
+       ],
+       "stored_from_register": true,
+       "source": "rax"
+      },
+      "exposure": {
+       "slot": 4,
+       "parameter_offset": "0x20",
+       "store_rvas": [
+        "0x3ec5114"
+       ],
+       "stored_from_register": true,
+       "source": "rax"
+      }
+     },
+     "fields": {
+      "pre_exposure": {
+       "parameter_offset": "0x30",
+       "bytes": 4,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec5122"
+       ]
+      },
+      "render_rect": {
+       "parameter_offset": "0x34",
+       "bytes": 16,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec507c",
+        "0x3ec512c"
+       ]
+      },
+      "jitter": {
+       "parameter_offset": "0x44",
+       "bytes": 8,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec512c"
+       ]
+      },
+      "motion_vector_scale": {
+       "parameter_offset": "0x4c",
+       "bytes": 8,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec5134"
+       ]
+      },
+      "motion_vector_offset": {
+       "parameter_offset": "0x54",
+       "bytes": 8,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec5087"
+       ]
+      },
+      "depth_range": {
+       "parameter_offset": "0x5c",
+       "bytes": 8,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec5087",
+        "0x3ec508f",
+        "0x3ec509f"
+       ]
+      },
+      "reset": {
+       "parameter_offset": "0x64",
+       "bytes": 1,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec508f",
+        "0x3ec513c"
+       ]
+      },
+      "option_flags": {
+       "parameter_offset": "0x68",
+       "bytes": 4,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec508f",
+        "0x3ec5142"
+       ]
+      },
+      "sharpness": {
+       "parameter_offset": "0x6c",
+       "bytes": 4,
+       "stored": true,
+       "store_rvas": [
+        "0x3ec508f"
+       ]
+      }
+     },
+     "checks": [],
+     "discriminator_conflicts": [],
+     "store_count": 15
+    }
+   ],
+   "checks": [
+    {
+     "check": "game code calls the dispatch import (through wrappers)",
+     "ok": true,
+     "detail": "1 call path(s)"
+    },
+    {
+     "check": "required resource slots written from registers (output, color, motion_vectors, depth)",
+     "ok": true
+    },
+    {
+     "check": "temporal fields written at this ABI's offsets",
+     "ok": true
+    },
+    {
+     "check": "no stores at another revision's distinguishing offsets",
+     "ok": true,
+     "detail": ""
+    }
+   ],
+   "state": "static_layout_verified",
+   "primary_callsite": "0x3ec514c",
+   "id": "psml:psml_mfsr2",
+   "emulator_support": "not_implemented"
+  },
+  {
+   "family": "taa",
+   "adapter": "taa_static_v1",
+   "mode_requirement": "base",
+   "runtime_hook": "translator_dispatch",
+   "state": "static_candidate",
+   "taa": {
+    "shader_hash": "e34db815e5427957",
+    "color": [
+     12,
+     96
+    ],
+    "depth": [
+     12,
+     32
+    ],
+    "motion": [
+     0
+    ],
+    "output": [
+     12,
+     192
+    ],
+    "outputs": [
+     [
+      12,
+      192
+     ]
+    ],
+    "history": [
+     [
+      12,
+      128
+     ]
+    ],
+    "constants": {
+     "buffers": [
+      [
+       12,
+       224
+      ],
+      [
+       12,
+       240
+      ],
+      [
+       8
+      ]
+     ],
+     "tables": [
+      [
+       12
+      ]
+     ]
+    },
+    "calibrate": [
+     "jitter",
+     "motion_vectors",
+     "output_scale",
+     "depth_convention",
+     "hudless",
+     "display_orientation"
+    ],
+    "composite_candidates": [
+     "51c6fecdde587e2a",
+     "46fc65da3f2c6f21",
+     "2617273b98902601",
+     "f8b6fb972e6e491b",
+     "a600894d93968ea7",
+     "07e9d6fc4e3b9b95",
+     "8fde6436fd94929b",
+     "94399dbed1469d19",
+     "aaff53523b7560d0"
+    ]
+   },
+   "static": {
+    "candidates": [
+     {
+      "hash": "e34db815e5427957",
+      "score": 17,
+      "source": "PPSA03671-app/eboot.bin",
+      "offset": "0x81daa00",
+      "size": 1268,
+      "roles": {
+       "output": [
+        [
+         12,
+         192
+        ]
+       ],
+       "motion": [
+        [
+         0
+        ]
+       ],
+       "depth_or_mask": [
+        [
+         12,
+         0
+        ],
+        [
+         12,
+         32
+        ],
+        [
+         12,
+         64
+        ]
+       ],
+       "history_candidates": [
+        [
+         12,
+         128
+        ]
+       ],
+       "colour_candidates": [
+        [
+         12,
+         96
+        ]
+       ]
+      }
+     },
+     {
+      "hash": "7608965248867f73",
+      "score": 16,
+      "source": "PPSA03671-app/eboot.bin",
+      "offset": "0x85aada0",
+      "size": 3540,
+      "roles": {
+       "output": [
+        [
+         12,
+         288
+        ]
+       ],
+       "motion": [
+        [
+         12,
+         128
+        ]
+       ],
+       "depth_or_mask": [
+        [
+         12,
+         192
+        ]
+       ],
+       "history_candidates": [
+        [
+         0
+        ]
+       ],
+       "colour_candidates": [
+        [
+         12,
+         0
+        ],
+        [
+         12,
+         160
+        ],
+        [
+         12,
+         32
+        ],
+        [
+         12,
+         64
+        ],
+        [
+         12,
+         96
+        ],
+        [
+         12,
+         224
+        ],
+        [
+         12,
+         256
+        ]
+       ]
+      }
+     },
+     {
+      "hash": "cd6a017d5c913e3d",
+      "score": 15,
+      "source": "PPSA03671-app/eboot.bin",
+      "offset": "0x855cba0",
+      "size": 1076,
+      "roles": {
+       "output": [
+        [
+         12,
+         96
+        ]
+       ],
+       "motion": [
+        [
+         12,
+         32
+        ]
+       ],
+       "depth_or_mask": [
+        [
+         12,
+         64
+        ]
+       ],
+       "history_candidates": [
+        [
+         12,
+         0
+        ]
+       ],
+       "colour_candidates": [
+        [
+         0
+        ]
+       ]
+      }
+     },
+     {
+      "hash": "f5a9550466530f88",
+      "score": 15,
+      "source": "PPSA03671-app/eboot.bin",
+      "offset": "0x855bc00",
+      "size": 1172,
+      "roles": {
+       "output": [
+        [
+         12,
+         160
+        ]
+       ],
+       "motion": [
+        [
+         12,
+         96
+        ]
+       ],
+       "depth_or_mask": [
+        [
+         12,
+         0
+        ],
+        [
+         12,
+         64
+        ],
+        [
+         12,
+         128
+        ]
+       ],
+       "history_candidates": [
+        [
+         12,
+         32
+        ]
+       ],
+       "colour_candidates": [
+        [
+         0
+        ]
+       ]
+      }
+     },
+     {
+      "hash": "74a3e1930baf2926",
+      "score": 15,
+      "source": "PPSA03671-app/eboot.bin",
+      "offset": "0x84a6a40",
+      "size": 1184,
+      "roles": {
+       "output": [
+        [
+         12,
+         96
+        ]
+       ],
+       "motion": [
+        [
+         12,
+         0
+        ]
+       ],
+       "depth_or_mask": [
+        [
+         12,
+         64
+        ]
+       ],
+       "history_candidates": [
+        [
+         12,
+         32
+        ]
+       ],
+       "colour_candidates": [
+        [
+         0
+        ]
+       ]
+      }
+     }
+    ],
+    "prefiltered": 88,
+    "ambiguous_with": [],
+    "shaders": {
+     "unique_shaders": 1122,
+     "by_source": {
+      "executable": 1076,
+      "psp": 0,
+      "sprx": 46
+     }
+    }
+   },
+   "checks": [
+    {
+     "check": "one shader scores as a TAA resolve",
+     "ok": true,
+     "detail": "e34db815e5427957 of 1122 shaders"
+    }
+   ],
+   "id": "taa:taa_static_v1",
+   "emulator_support": "implemented"
+  }
+ ],
+ "selected_route": "taa:taa_static_v1",
+ "capabilities": {
+  "upscaler": {
+   "state": "available",
+   "route": "taa:taa_static_v1",
+   "upscalers": [
+    "hlx_fsr4",
+    "hlx_dlss_e"
+   ],
+   "reason": "the game's TAA pass was found in its shaders (no launch); Kyty calibrates it in the first seconds of play and re-checks its live inputs before replacing it"
+  },
+  "frame_generation": {
+   "state": "available",
+   "modes": [
+    "fsr3"
+   ],
+   "reason": "depth and motion vectors come from the same verified boundary"
+  },
+  "render_presets": {
+   "state": "dynamic_only",
+   "reason": "the game's own dynamic resolution is kept (controller not mapped)"
+  }
+ },
+ "runtime": {
+  "adapter": "taa_static_v1",
+  "sha256": "3f15c99ec93aaf827b2d0338ee730400be12ebc7c20ebfe76773597d015f5497",
+  "taa": {
+   "shader_hash": "4392398e1aad9cf5",
+   "color": [
+    0
+   ],
+   "depth": [
+    12,
+    160
+   ],
+   "motion": [
+    12,
+    32
+   ],
+   "output": [
+    12,
+    192
+   ],
+   "outputs": [
+    [
+     12,
+     192
+    ]
+   ],
+   "history": [
+    [
+     12,
+     0
+    ]
+   ],
+   "constants": {
+    "buffers": [
+     [
+      12,
+      224
+     ],
+     [
+      12,
+      240
+     ],
+     [
+      12,
+      256
+     ],
+     [
+      12,
+      272
+     ],
+     [
+      8
+     ]
+    ],
+    "tables": [
+     [
+      12
+     ]
+    ]
+   },
+   "calibrate": [
+    "jitter",
+    "motion_vectors",
+    "output_scale",
+    "depth_convention",
+    "hudless",
+    "display_orientation"
+   ],
+   "output_consumer": {
+    "shader_hash": "908d87cc0d425dc8",
+    "output": [
+     12,
+     0
+    ]
+   },
+   "composite_candidates": [
+    "7608965248867f73"
+   ],
+   "notes": "Marvel's Wolverine 2026-11-15: resolve 0x11d03f7900 found at run time (not by the static scan); copy pass 908d87cc decodes its sqrt-Reinhard 10:10:10:2 result into the 11:11:10 scene; composite 76089652 (UD0 3D LUT, slot0 scene, slot224 UI). Tested profile shipped with the package (beta/title-profiles); the static scan does not find this resolve."
+  }
+ }
+}

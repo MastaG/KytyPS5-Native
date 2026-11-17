@@ -243,6 +243,39 @@ PY
 ) || true
     fi
 fi
+# Marvel's Wolverine: the static scan does not find its temporal upscaler (the resolve was found at run time), so the
+# package carries the tested profile (upscalers/title-profiles) for the executable it was made with. It is used only
+# when this copy's executable is that one (same SHA-256 as the scan's); a copy into the profile folder keeps the
+# calibration the emulator caches next to it. With HLX, the Fidelity mode's dynamic resolution may go down to 1664x936
+# (the Performance mode's floor): HLX then fits in Fidelity's 33 ms frame instead of costing frames.
+title_profiles="$bundle_root/upscalers/title-profiles"
+if [[ "$astro_manual" == "0" && "$up_build" == "1" && "$mode" == upstream && "$content_title" == PPSA03671 &&
+      -n "$up_profile" && -f "$up_profile" ]]; then
+    tested="$(python3 -I - "$up_profile" "$title_profiles" <<'PY'
+import json, sys, pathlib
+try:
+    sha = json.load(open(sys.argv[1], encoding='utf-8'))['game']['sha256']
+    for p in sorted(pathlib.Path(sys.argv[2]).glob('PPSA03671-*.json')):
+        d = json.load(open(p, encoding='utf-8'))
+        if isinstance(d, dict) and d.get('schema') == 'kyty-upscaler-profile' and d.get('game', {}).get('sha256') == sha:
+            print(p)
+            break
+except (OSError, ValueError, KeyError, TypeError):
+    pass
+PY
+)" || tested=
+    if [[ -n "$tested" ]]; then
+        tested_copy="$(dirname -- "$up_profile")/$(basename -- "$tested" .json).tested.json"
+        if cp -f -- "$tested" "$tested_copy" 2>/dev/null; then
+            up_profile="$tested_copy" up_state=available up_fg_state=available up_adapter=taa_static_v1
+            wolverine_drs="$title_profiles/$(basename -- "$tested" | cut -d- -f1-2)-fidelity-drs.json"
+            if [[ "$up_kind" != game && -f "$wolverine_drs" ]]; then export KYTY_RENDER_PRESET_PATCH="$wolverine_drs"; fi
+            echo "[Kyty launcher] Marvel's Wolverine: the package's tested upscaler profile ($(basename -- "$tested"))." >&2
+        fi
+    else
+        echo "[Kyty launcher] Marvel's Wolverine: this copy's executable is not the one the package's upscaler profile was tested with; the game keeps its own upscaler." >&2
+    fi
+fi
 if [[ "$up_state" == "available" ]]; then
     selected="$auto_binary"
     if [[ "$astro_manual" == "1" ]]; then selected="$astro_binary";
@@ -269,7 +302,8 @@ fi
 
 # Some TAA titles expose their render size through startup constants rather than a live DRS controller. Apply
 # the scanned profile's selected preset before render-graph construction, independently of --game-patch cheats.
-if [[ ( "$selected" == "$auto_binary" || "$selected" == "$taa_binary" ) && -n "$up_profile" && "$up_kind" != game ]]; then
+if [[ ( "$selected" == "$auto_binary" || "$selected" == "$taa_binary" ) && -n "$up_profile" && "$up_kind" != game &&
+      -z "${wolverine_drs:-}" ]]; then
     preset_tool="$(dirname -- "$scanner")/kyty-render-preset"
     if [[ -f "$preset_tool" ]]; then
         if preset_plan="$(python3 -I "$preset_tool" --profile "$up_profile" --preset "$up_preset")"; then

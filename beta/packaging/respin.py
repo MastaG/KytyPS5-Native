@@ -37,6 +37,8 @@ OVERLAY = {
     'beta/packaging/prepare-runtime.py': 'prepare-runtime.py',
     **{'beta/astro-templates/' + f.name: 'upscalers/astro-templates/' + f.name
        for f in sorted((Path(__file__).resolve().parents[1] / 'astro-templates').glob('*.json'))},
+    **{'beta/title-profiles/' + f.name: 'upscalers/title-profiles/' + f.name
+       for f in sorted((Path(__file__).resolve().parents[1] / 'title-profiles').glob('*.json'))},
 }
 CHANGES = [
     "Marvel's Wolverine runs at its target frame rate: Fidelity a locked 30 fps (was 15) and Performance about 50-58 "
