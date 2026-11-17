@@ -86,6 +86,7 @@ struct TitleProfile {
 	uint64_t taa_composite_hash = 0; // optional lower-resolution scene/UI composite to replace with HLX's output
 	Path     taa_composite_scene;
 	float    taa_near = 0.1f, taa_far = 10000.0f, taa_fov = 1.0f;
+	bool     taa_depth_linear = false; // "depth_linear": the depth input is view depth (converted to reversed Z at near 0.1)
 	uint32_t taa_hlx_flags = 0;     // 0: Kyty's default
 	// Frame generation's HUD-less frame: the title's final composite (pixel shader hash) draws its UI over this scene
 	// (a T# path from the composite's user data); Kyty saves sRGB(scene) there (fg_hudless.s). 0: none.
@@ -272,6 +273,10 @@ inline TitleProfile LoadTaaBlock(TitleProfile p, const Json* r, bool static_rout
 	}
 	const Json* c = JGet(t, "camera");
 	p.taa_near    = JFloat(JGet(c, "near"), p.taa_near);
+	if (const Json* lin = JGet(t, "depth_linear"); lin != nullptr && lin->is_boolean() && lin->get<bool>()) {
+		p.taa_depth_linear = true;
+		p.taa_near         = 0.1f; // the near plane copy1_rz.s and fg_guides.s convert with
+	}
 	p.taa_far     = JFloat(JGet(c, "far"), p.taa_far);
 	p.taa_fov     = JFloat(JGet(c, "fov"), p.taa_fov);
 	uint64_t flags = 0;

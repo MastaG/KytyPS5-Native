@@ -4,8 +4,6 @@
 The game's dynamic resolution picks render sizes from a table in its executable (0x9b7e7d0: 11 steps of
 {width, height, cost in the Fidelity, Performance and third modes}, 3840x2160 down to 1664x936; a 0 cost leaves the
 step out of that mode; init at 0x3f83d1e copies it, and rows 0/2 size the render targets).
-- fidelity-drs: Fidelity also gets the 1920x1080, 1792x1008 and 1664x936 steps (Performance's floor), with the
-  costs the other modes give them, so its dynamic resolution has room for HLX.
 - ultra-quality / quality / balanced / performance / ultra-performance: every step gets one size, so whatever the
   game's scaler picks it renders at that size in every mode (and allocates its targets at it)."""
 import json, struct
@@ -31,11 +29,6 @@ def plan(name, writes):
 
 here = Path(__file__).resolve().parent
 out = {}
-out['fidelity-drs'] = plan(
-    'Fidelity dynamic resolution down to 1664x936 (room for HLX: the 1920x1080, 1792x1008 and 1664x936 steps join the '
-    'Fidelity ladder with the costs the other modes give them)',
-    [{'offset': f'{TABLE + i * 20:x}', 'off': row(w, h, (a, b, c)), 'on': row(w, h, (b, b, c))}
-     for i, (w, h, a, b, c) in enumerate(ROWS) if a == 0])
 for preset, (fw, fh) in FIXED.items():
     out[preset] = plan(f'Fixed {fw}x{fh} render resolution (every dynamic-resolution step, every graphics mode)',
                        [{'offset': f'{TABLE + i * 20:x}', 'off': row(w, h, (a, b, c)), 'on': row(fw, fh, (a, b, c))}

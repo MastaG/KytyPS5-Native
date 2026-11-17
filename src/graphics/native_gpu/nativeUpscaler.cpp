@@ -261,6 +261,7 @@ constexpr uint64_t kHudlessTables = 0x12400;  // its tables: one 64-byte table p
 constexpr uint64_t kCompositeTables = 0x12800; // kSlots private {root pointers, scene/UI composite globals}, 128 bytes each
 constexpr uint64_t kPassthroughTables = 0x14800; // render-sized TAA exposure copies, separate from the final composite
 constexpr uint64_t kCodeCopy4A1 = 0x17000;
+constexpr uint64_t kCodeCopy1Rz = 0x17100;      // copy1_rz.s: linear view depth -> reversed-Z (taa depth_linear)
 constexpr uint64_t kCodeCalLuma = 0x16800;      // cal_luma.s: TAA calibration luminance planes (taa_static_v1)
 constexpr uint64_t kCalTables   = 0x16A00;      // its tables: two 64-byte tables per frame generation guide set
 bool StallWanted() {
@@ -602,6 +603,8 @@ bool EnsureControl() {
 	std::memcpy(control.cpu + kCodeCopy4A0, k_upscaler_copy4_a0, sizeof(k_upscaler_copy4_a0));
 	static_assert(sizeof(k_upscaler_copy4_a1) <= 0x100);
 	std::memcpy(control.cpu + kCodeCopy4A1, k_upscaler_copy4_a1, sizeof(k_upscaler_copy4_a1));
+	static_assert(sizeof(k_upscaler_copy1_rz) <= 0x100 && kCodeCopy1Rz + 0x100 <= kTransparentUi);
+	std::memcpy(control.cpu + kCodeCopy1Rz, k_upscaler_copy1_rz, sizeof(k_upscaler_copy1_rz));
 	static_assert(sizeof(k_upscaler_fg_guides) <= 0x800);
 	std::memcpy(control.cpu + kCodeFgGuides, k_upscaler_fg_guides, sizeof(k_upscaler_fg_guides));
 	static_assert(sizeof(k_upscaler_scale4_a0) <= 0x1000 && kCodeScale4A0 + 0x1000 <= kControlSize);
@@ -1386,6 +1389,7 @@ void FgEmit(Snapshot& s, uint32_t slot, unsigned& table, bool compute_ring, std:
 		p[24] = w - 1u;
 		p[25] = Prof().taa_display_mirror_x && s.stage != 5 ? 1u : 0u;
 		p[26] = FgDepthFlags() & 1u;
+		p[27] = Prof().taa_depth_linear ? 1u : 0u; // fg_guides.s converts linear view depth
 	}
 	const uint64_t code = g_dev.control.va + kCodeFgGuides, tva = g_dev.control.va + t;
 	const uint32_t rsrc1 = ((16u / 4u) - 1u) | (0xc0u << 12u) | (1u << 21u) | (1u << 30u); // 16 VGPRs wave64, denorms, DX10_CLAMP, MEM_ORDERED
@@ -1634,7 +1638,7 @@ bool CalibratedExposure() {
 // Calibrated: HDR colour, the measured depth convention (reversed Z taken as infinite), auto exposure, dynamic res.
 bool CalibratedHlxFlags(uint32_t* flags) {
 	if (!Prof().taa_calibrate || g_cal_state.load(std::memory_order_acquire) != 2) return false;
-	*flags = 0x1u | (g_cal.depth_inverted ? 0x18u : 0u) | 0x20u | 0x40u;
+	*flags = 0x1u | (g_cal.depth_inverted || Prof().taa_depth_linear ? 0x18u : 0u) | 0x20u | 0x40u;
 	return true;
 }
 
@@ -3831,6 +3835,26 @@ void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t u
 	if (CompositeRouteWanted() && rw == s.res[kOutput].t.Width5() + 1u && rh == s.res[kOutput].t.Height5() + 1u) {
 		g_composite_taa = std::make_shared<Snapshot>(s);
 	}
+	// (diagnostic) The depth input's values at two moments of play: device depth lies in [0, 1], linear depth does not.
+	if ((s.id == 2000 || s.id == 3000) && s.res[kDepth].present && static_cast<uint32_t>(s.res[kDepth].t.Format()) == 13u) {
+		const auto*  p = reinterpret_cast<const volatile uint16_t*>(s.res[kDepth].t.Base40());
+		const uint32_t n = std::min<uint32_t>(1u << 20u, (s.res[kDepth].t.Width5() + 1u) * (s.res[kDepth].t.Height5() + 1u));
+		uint32_t     hist[8] {}, nan = 0;
+		float        lo = 1e30f, hi = -1e30f;
+		for (uint32_t i = 0; p != nullptr && i < n; i += 3) {
+			const uint16_t hbits = p[i];
+			const uint32_t e = (hbits >> 10u) & 31u, m = hbits & 1023u;
+			const float    v = (hbits & 0x8000u ? -1.0f : 1.0f) *
+			                (e == 0 ? std::ldexp(static_cast<float>(m), -24) : e == 31 ? INFINITY : std::ldexp(1.0f + m / 1024.0f, static_cast<int>(e) - 15));
+			if (!std::isfinite(v)) { nan++; continue; }
+			lo = std::min(lo, v);
+			hi = std::max(hi, v);
+			hist[v < 0 ? 0 : v < 0.01f ? 1 : v < 0.1f ? 2 : v < 0.5f ? 3 : v <= 1.0f ? 4 : v < 10.0f ? 5 : v < 1000.0f ? 6 : 7]++;
+		}
+		LogJson("{\"event\":\"depth_values\",\"invocation\":%llu,\"min\":%g,\"max\":%g,\"nonfinite\":%u,"
+		        "\"hist\":{\"<0\":%u,\"<0.01\":%u,\"<0.1\":%u,\"<0.5\":%u,\"<=1\":%u,\"<10\":%u,\"<1000\":%u,\">=1000\":%u}}",
+		        static_cast<unsigned long long>(s.id), lo, hi, nan, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5], hist[6], hist[7]);
+	}
 	// KYTY_NATIVE_UPSCALER_LOG_RENDER=1 (diagnostic): every TAA invocation's render size with CLOCK_MONOTONIC ms (the
 	// flip trace's clock), to see how the title's dynamic resolution follows the frame time.
 	if (static const bool log_render = std::getenv("KYTY_NATIVE_UPSCALER_LOG_RENDER") != nullptr; log_render) {
@@ -4136,7 +4160,8 @@ bool TakeBoundary(uint64_t packet, uint64_t shader, bool compute_ring, Boundary*
 				continue;
 			}
 			WriteCopyTable(t, s->res[i].t, g_dev.hlx[i]);
-			EmitDispatch(out->before, CopyCode(g_dev.region[i].format), t, g_dev.region[i], s->dims[i][0], s->dims[i][1], compute_ring);
+			const uint64_t code = i == kDepth && Prof().taa_depth_linear ? kCodeCopy1Rz : CopyCode(g_dev.region[i].format);
+			EmitDispatch(out->before, code, t, g_dev.region[i], s->dims[i][0], s->dims[i][1], compute_ring);
 		}
 		if (s->stage == 5) {
 			// The final composite samples HLX's 4K image directly. No copy back
@@ -4326,6 +4351,7 @@ FrameGenMode FrameGen() {
 }
 uint32_t FgDepthFlags() {
 	const TitleProfile& P = Prof();
+	if (P.taa && P.taa_depth_linear) return 3u; // converted to reversed Z, infinite far (copy1_rz.s, fg_guides.s)
 	if (uint32_t f = 0; CalibratedHlxFlags(&f)) {
 		return ((f & 0x8u) != 0 ? 1u : 0u) | ((f & 0x10u) != 0 ? 2u : 0u);
 	}

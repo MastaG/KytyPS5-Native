@@ -12,6 +12,7 @@
   s_load_dwordx4 s[24:27], s[0:1], 0x40
   s_load_dwordx4 s[28:31], s[0:1], 0x50
   s_load_dword s44, s[0:1], 0x68          // inverted depth
+  s_load_dword s45, s[0:1], 0x6c          // 1: the depth is linear view depth (converted as copy1_rz.s does)
   s_load_dwordx2 s[40:41], s[0:1], 0x60
   v_and_b32 v1, 7, v0
   v_lshrrev_b32 v2, 3, v0
@@ -48,6 +49,14 @@
   v_add_nc_u32 v12, s38, v5
   image_load v13, v[11:12], s[8:15] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm
   s_waitcnt vmcnt(0)
+  s_cmp_eq_u32 s45, 0
+  s_cbranch_scc1 .Ldevice
+  v_max_f32 v14, 0x3dcccccd, v13          // reversed-Z: near / max(z, near), z <= 0 at the far plane
+  v_rcp_f32 v14, v14
+  v_mul_f32 v14, 0x3dcccccd, v14
+  v_cmp_lt_f32 vcc, 0, v13
+  v_cndmask_b32 v13, 0, v14, vcc
+.Ldevice:
   s_cmp_eq_u32 s44, 0
   s_cbranch_scc0 .Linverted
   v_cmp_lt_f32 vcc, v13, v8

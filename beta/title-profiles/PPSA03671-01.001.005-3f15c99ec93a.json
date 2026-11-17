@@ -716,7 +716,8 @@
    "composite_candidates": [
     "7608965248867f73"
    ],
-   "notes": "Marvel's Wolverine 2026-11-15: resolve 0x11d03f7900 found at run time (not by the static scan); copy pass 908d87cc decodes its sqrt-Reinhard 10:10:10:2 result into the 11:11:10 scene; composite 76089652 (UD0 3D LUT, slot0 scene, slot224 UI). Tested profile shipped with the package (beta/title-profiles); the static scan does not find this resolve."
+   "notes": "Marvel's Wolverine 2026-11-15: resolve 0x11d03f7900 found at run time (not by the static scan); copy pass 908d87cc decodes its sqrt-Reinhard 10:10:10:2 result into the 11:11:10 scene; composite 76089652 (UD0 3D LUT, slot0 scene, slot224 UI). Tested profile shipped with the package (beta/title-profiles); the static scan does not find this resolve. Depth slot [12,160] is linear view depth in world units (2.4..10008 in play): depth_linear converts it to reversed Z for HLX and frame generation.",
+   "depth_linear": true
   }
  }
 }
