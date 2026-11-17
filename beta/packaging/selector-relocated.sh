@@ -14,6 +14,7 @@ dry_run="${KYTY_EMULATOR_SELECTOR_DRY_RUN:-0}"
 fg_mode="${KYTY_SHARP_FG_MODE:-off}"
 scream_requested="${KYTY_DEMONS_SCREAM_ASSERT_RECOVERY:-0}"
 scream_title="${KYTY_BC250_TITLE_ID:-}"
+user_spin_pacer="${KYTY_NATIVE_GPU_SPIN_PACER:-}"
 audio_test="${KYTY_BC250_AUDIO_TEST:-off}"
 audio_binary="$bundle_root/emulator/kyty_emulator_audio"
 case "$fg_mode" in off|fixed|adaptive) ;; *) fg_mode=off ;; esac
@@ -85,6 +86,14 @@ if [[ "$mode" == upstream && -z "$content_title" ]]; then
     if [[ -n "$game_arg" ]]; then
         content_title="$(python3 -I "$bundle_root/prepare-runtime.py" --title "$game_arg")"
     fi
+fi
+
+# Marvel's Wolverine paces its frames with a compute shader that spins on the GPU clock until a target its CPU
+# computed; on this path every frame then waited a full extra flip interval (15 fps Fidelity, 30-40 Performance).
+# Without that dispatch the game runs at its GPU's pace with flips at the vblanks: Fidelity 30, Performance ~50.
+# KYTY_NATIVE_GPU_SPIN_PACER=keep (set by the user) leaves it in.
+if [[ "$mode" == upstream && "$content_title" == PPSA03671 ]]; then
+    export KYTY_NATIVE_GPU_SPIN_PACER="${user_spin_pacer:-skip}"
 fi
 
 # Lossless Scaling frame generation through the bundled MAKO Renderer 4.6.0 Vulkan layer (GPL-3.0). The only

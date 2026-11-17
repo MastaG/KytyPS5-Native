@@ -14,6 +14,7 @@
 #include <set>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #if defined(__linux__)
 #include <sys/uio.h>
 #include <unistd.h>
@@ -554,6 +555,38 @@ void EmitClockEop(std::vector<uint32_t>& ib, uint64_t addr) {
 // 0), the micro engine or the prefetch parser, any compare function but the reserved 7.
 // libSceAgc's debug markers write the rest of their string with WRITE_DATA to SQ_THREAD_TRACE_USERDATA_3
 // (register 0xc343, DST_SEL 0, micro engine; the thread-trace user data registers 0xc340..0xc347).
+// A GPU frame pacer: a compute shader that spins on s_memrealtime (read at least twice, a backward s_branch) in
+// its first 256 dwords. Marvel's Wolverine's holds each frame up to one flip interval (2026-11-15).
+bool IsSpinPacerShader(uint64_t va) {
+	static std::mutex                         mutex;
+	static std::unordered_map<uint64_t, bool> known;
+	std::lock_guard                           lock(mutex);
+	if (const auto it = known.find(va); it != known.end()) {
+		return it->second;
+	}
+	bool pacer = false;
+	if (va != 0) {
+		const auto* code   = reinterpret_cast<const volatile uint32_t*>(va);
+		uint32_t    clocks = 0;
+		bool        back   = false;
+		for (uint32_t i = 0; i < 256; i++) {
+			const uint32_t w = code[i];
+			if (w == 0xbf810000u) { // s_endpgm
+				break;
+			}
+			if ((w & 0xfc000000u) == 0xf4000000u) { // SMEM, 2 dwords
+				clocks += ((w >> 18u) & 0xffu) == 0x25u ? 1u : 0u;
+				i++;
+			} else if ((w & 0xffff0000u) == 0xbf820000u && (w & 0x8000u) != 0) { // s_branch back
+				back = true;
+			}
+		}
+		pacer = clocks >= 2 && back;
+	}
+	known.emplace(va, pacer);
+	return pacer;
+}
+
 bool TraceUserDataWrite(uint32_t control, uint32_t addr_lo, uint32_t addr_hi) {
 	return ((control >> 8u) & 0xfu) == 0u && (control >> 30u) == 0u && addr_hi == 0u && addr_lo >= 0xc340u && addr_lo <= 0xc347u;
 }
@@ -6496,6 +6529,18 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 						snap.ps_user_data[i] = reg(sh, 0x240u + i);
 					}
 					r.inspected.push_back(snap);
+				}
+				// KYTY_NATIVE_GPU_SPIN_PACER=skip: a one-group dispatch of a spin pacer (IsSpinPacerShader) is left
+				// out; the frame goes on at the GPU's own pace and its flips at the vblanks.
+				if (static const bool skip_pacer = [] {
+					    const char* v = std::getenv("KYTY_NATIVE_GPU_SPIN_PACER");
+					    return v != nullptr && std::strcmp(v, "skip") == 0;
+				    }();
+				    skip_pacer && !m_compute_ring && !cond.active && body_count >= 3 && bptr[0] == 1u && bptr[1] == 1u && bptr[2] == 1u &&
+				    IsSpinPacerShader((static_cast<uint64_t>(reg(sh, 0x20Cu)) << 8u) | (static_cast<uint64_t>(reg(sh, 0x20Du) & 0xffu) << 40u))) {
+					NoteOnce(44, "spin pacer: a GPU frame pacer's dispatch left out (KYTY_NATIVE_GPU_SPIN_PACER=skip)");
+					stats.dispatches++;
+					break;
 				}
 				if (m_compute_ring) {
 					body.insert(body.end(), dcb.begin() + dw, dcb.begin() + dw + size);
