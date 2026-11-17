@@ -37,6 +37,10 @@ OVERLAY = {
     'beta/packaging/prepare-runtime.py': 'prepare-runtime.py',
     **{'beta/astro-templates/' + f.name: 'upscalers/astro-templates/' + f.name
        for f in sorted((Path(__file__).resolve().parents[1] / 'astro-templates').glob('*.json'))},
+    **{'beta/title-profiles/' + f.name: 'upscalers/title-profiles/' + f.name
+       for f in sorted((Path(__file__).resolve().parents[1] / 'title-profiles').glob('*.json'))},
+    **{'beta/title-defaults/' + f.name: 'title-defaults/' + f.name
+       for f in sorted((Path(__file__).resolve().parents[1] / 'title-defaults').glob('*.json'))},
 }
 CHANGES = [
     "Marvel's Wolverine runs at its target frame rate: Fidelity a locked 30 fps (was 15) and Performance about 50-58 "
@@ -50,6 +54,16 @@ CHANGES = [
     "Superkeka's KytyPS5-Native main of 2026-11-17 (f820b8e9) merged: video-out buffers keep their DCC behind a plain "
     "copy for the presenter and DCC metadata is reset after a title's DCC clear (Gran Turismo 7's black replays), game "
     "patches move console addresses in their code",
+    "Marvel's Wolverine with HLX and frame generation: the package carries the tested upscaler profile and calibration "
+    "for the game's 01.001.005 executable (the scan does not find its upscaler pass) and fixed 4K render presets "
+    "(Ultra Quality 2816x1584, Balanced 2304x1296, Performance 1920x1080); the HLX helper takes the game's 11:11:10 "
+    "float colour and 16-bit float depth",
+    "Marvel's Wolverine starts with HLX FSR 4, the Balanced preset (2304x1296 upscaled to 4K) and FSR 3 frame "
+    "generation; its Quality preset runs as Balanced for now (at 2560x1440 the game switches to an upscaler pass the "
+    "profile does not cover yet)",
+    "Frame generation keeps running when a game stops drawing its video-out buffers in a way the emulator watches "
+    "(Wolverine's gameplay), and linear view depth is converted for HLX and frame generation (no ghosting around "
+    "moving characters)",
     "The native and upscaler backends are rebuilt from that source; the other backends are Beta 6's",
 ]
 
@@ -66,10 +80,14 @@ def version():
 def stage(previous, new_version, *replacements):
     previous = Path(previous)
     new_backends = {}
+    helper = None
     for item in replacements:
         name, _, elf = item.partition('=')
+        if name == 'hlx_server' and elf and Path(elf).is_file():
+            helper = Path(elf)  # a built beta/hlx-helper (hlx_server.exe.so), replacing upscalers/helper's
+            continue
         if not name.startswith('kyty_emulator_') or not elf or not Path(elf).is_file():
-            raise SystemExit('replacement must be kyty_emulator_NAME=/path/to/elf: ' + item)
+            raise SystemExit('replacement must be kyty_emulator_NAME=/path/to/elf or hlx_server=/path/to/hlx_server.exe.so: ' + item)
         new_backends[name] = Path(elf)
     old = json.loads((previous / 'BUILD-MANIFEST.json').read_text())
     if root.exists():
@@ -98,6 +116,13 @@ def stage(previous, new_version, *replacements):
         (root / dst).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(repo / src, root / dst)
         (root / dst).chmod(mode)
+    if helper is not None:
+        target = root / 'upscalers/helper/hlx_server.exe.so'
+        if not target.is_file():
+            raise SystemExit('no upscalers/helper/hlx_server.exe.so in the previous package')
+        shutil.copyfile(helper, target)
+        target.chmod(0o755)
+        print(f'replaced upscalers/helper/hlx_server.exe.so: {sha(target)[:12]} from {helper}')
     elf_dir = root / 'emulator/elf'
     replaced = {}
     for name, elf in new_backends.items():
@@ -117,7 +142,7 @@ def stage(previous, new_version, *replacements):
     manifest['respin_of'] = old['version']
     manifest['changes_since_' + old['version'].rsplit('-', 1)[-1]] = CHANGES
     manifest['changed_files'] = sorted(OVERLAY.values()) + ['VERSION', 'BUILD-MANIFEST.json', 'VALIDATION.json', 'FILES.sha256'] + \
-        sorted('emulator/elf/' + n for n in new_backends)
+        sorted('emulator/elf/' + n for n in new_backends) + (['upscalers/helper/hlx_server.exe.so'] if helper else [])
     if replaced:
         head = subprocess.run(['git', '-C', str(repo), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
         manifest['emulator_commit'] = head

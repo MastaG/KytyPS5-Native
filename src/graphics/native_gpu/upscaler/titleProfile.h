@@ -53,11 +53,27 @@ struct TitleProfile {
 	struct Path {
 		uint32_t              ud = 0;
 		std::vector<uint32_t> offs;
-		[[nodiscard]] bool    Valid() const { return !offs.empty(); }
+		bool                  inline_ud = false; // [ud] alone: the descriptor is held in the user data registers themselves
+		[[nodiscard]] bool    Valid() const { return inline_ud || !offs.empty(); }
 	};
+	// Manual raster TAA route: collect the pixel shader's inputs, then replace its output immediately before
+	// a verified compute or raster consumer. When replaced, both TAA MRTs are updated for fallback.
+	bool     taa_raster = false, taa_sizes_integer = false;
+	bool     taa_dynamic_framegen_only = false;
+	uint64_t taa_consumer_hash = 0;
+	// taa.output_consumer {"shader_hash", "output": path}: a compute TAA whose result a later pass converts into the scene
+	// image (Marvel's Wolverine: the resolve stores an encoded 10:10:10:2 image, a copy pass decodes it into the 11:11:10
+	// scene that transparents and the composite then use). HLX takes the TAA's inputs at its dispatch, which still runs,
+	// and replaces that later pass, writing the scene image (its `output`) itself.
+	uint64_t taa_out_consumer_hash = 0;
+	std::vector<uint64_t> taa_consumer_hashes; // explicitly verified alternative consumers
 	bool     taa      = false;
 	uint64_t taa_hash = 0;
 	Path     taa_color, taa_depth, taa_motion, taa_output, taa_jitter; // taa_jitter: last offset = two floats
+	// A resolve that writes two images (static routes: taa.outputs): the displayed one and the next frame's history,
+	// told apart at run time (which one the next invocation reads back); taa.history: the history read's path(s).
+	std::vector<Path> taa_outputs, taa_history;
+	Path              taa_out_consumer_output;
 	Path     taa_render_size, taa_output_size; // two floats each (the TAA's own constants), optional
 	Path     taa_scale;                        // a V#: the float at its base + taa_scale_off scales the output (exposure)
 	uint32_t taa_scale_off = 0;
@@ -70,11 +86,22 @@ struct TitleProfile {
 	uint64_t taa_composite_hash = 0; // optional lower-resolution scene/UI composite to replace with HLX's output
 	Path     taa_composite_scene;
 	float    taa_near = 0.1f, taa_far = 10000.0f, taa_fov = 1.0f;
+	bool     taa_depth_linear = false; // "depth_linear": the depth input is view depth (converted to reversed Z at near 0.1)
 	uint32_t taa_hlx_flags = 0;     // 0: Kyty's default
 	// Frame generation's HUD-less frame: the title's final composite (pixel shader hash) draws its UI over this scene
 	// (a T# path from the composite's user data); Kyty saves sRGB(scene) there (fg_hudless.s). 0: none.
+	bool     taa_hl_replay = false; // replay the title's own composite with a transparent UI texture
 	uint64_t taa_hl_hash = 0;
 	Path     taa_hl_scene;
+	// adapter taa_static_v1 (tools/upscaler-scan static discovery, no launch): the paths come from the shaders; what only
+	// data can tell (jitter, vector convention, exposure, depth convention) is calibrated at run time (taaCalibration.h)
+	// from the constants the TAA reads: its buffers (V# paths) and tables (their base addresses).
+	bool              taa_calibrate = false;
+	// taa.depth null (a static route whose resolve reads no depth): the frame's depth target (DB registers), read
+	// through a descriptor the title itself builds for it (another pass samples it)
+	bool              taa_depth_target = false;
+	std::vector<Path> taa_cal_buffers, taa_cal_tables;
+	float             taa_mv_scale_x = 0.0f, taa_mv_scale_y = 0.0f; // calibrated: FSR scale per render pixel axis (0: unset)
 };
 
 inline TitleProfile BuiltinYotei() {
@@ -130,11 +157,12 @@ inline bool JPair(const Json* v, uint64_t* a, uint64_t* b) {
 }
 
 inline bool JPath(const Json* v, TitleProfile::Path* out) {
-	if (v == nullptr || !v->is_array() || v->size() < 2 || v->size() > 6) return false;
+	if (v == nullptr || !v->is_array() || v->size() < 1 || v->size() > 6) return false;
 	uint64_t x = 0;
 	if (!JU64(&(*v)[0], &x) || x > 30) return false;
 	out->ud = static_cast<uint32_t>(x);
 	out->offs.clear();
+	out->inline_ud = v->size() == 1; // (static discovery: ['udinline', u] -> [u])
 	for (size_t i = 1; i < v->size(); i++) {
 		if (!JU64(&(*v)[i], &x) || x > 0x100000) return false;
 		out->offs.push_back(static_cast<uint32_t>(x));
@@ -149,7 +177,7 @@ inline float JFloat(const Json* v, float def) {
 // runtime.taa: {"shader_hash": "0x..", "color": [ud, off...], "depth": [...], "motion": [...], "output": [...],
 //               "jitter": {"path": [...], "units": "uv"|"pixels", "sign": [x, y]}, "motion_vectors": "uv_current_minus_previous",
 //               "formats": {"color": 71, ...}, "camera": {"near":, "far":, "fov":}, "hlx_flags": n}
-inline TitleProfile LoadTaaBlock(TitleProfile p, const Json* r) {
+inline TitleProfile LoadTaaBlock(TitleProfile p, const Json* r, bool static_route = false) {
 	const Json* t = JGet(r, "taa");
 	if (t == nullptr || !t->is_object()) {
 		p.why = "profile taa block missing";
@@ -158,8 +186,58 @@ inline TitleProfile LoadTaaBlock(TitleProfile p, const Json* r) {
 	const std::string hash = JStr(JGet(t, "shader_hash"));
 	p.taa_hash             = hash.empty() ? 0 : std::strtoull(hash.c_str(), nullptr, 16);
 	const Json* j          = JGet(t, "jitter");
-	bool        ok         = p.taa_hash != 0 && JPath(JGet(t, "color"), &p.taa_color) && JPath(JGet(t, "depth"), &p.taa_depth) &&
-	          JPath(JGet(t, "motion"), &p.taa_motion) && JPath(JGet(t, "output"), &p.taa_output) && JPath(JGet(j, "path"), &p.taa_jitter);
+	const Json* dj         = JGet(t, "depth");
+	p.taa_depth_target     = (static_route || JStr(JGet(t, "depth_source")) == "depth_target") && (dj == nullptr || dj->is_null());
+	bool        ok         = p.taa_hash != 0 && JPath(JGet(t, "color"), &p.taa_color) && (p.taa_depth_target || JPath(dj, &p.taa_depth)) &&
+	          JPath(JGet(t, "motion"), &p.taa_motion) && JPath(JGet(t, "output"), &p.taa_output) &&
+	          (JPath(JGet(j, "path"), &p.taa_jitter) || static_route);
+	if (static_route) {
+		p.taa_calibrate = true;
+		for (const char* key: {"outputs", "history"}) {
+			if (const Json* a = JGet(t, key); a != nullptr && a->is_array()) {
+				for (const auto& e: *a) {
+					TitleProfile::Path q;
+					if (JPath(&e, &q)) (key[0] == 'o' ? p.taa_outputs : p.taa_history).push_back(q);
+				}
+			}
+		}
+		if (p.taa_outputs.size() != 2) p.taa_outputs.clear();
+		const Json* c   = JGet(t, "constants");
+		if (const Json* b = JGet(c, "buffers"); b != nullptr && b->is_array()) {
+			for (const auto& e: *b) {
+				TitleProfile::Path q;
+				if (JPath(&e, &q) && !q.inline_ud) p.taa_cal_buffers.push_back(q);
+			}
+		}
+		if (const Json* tb = JGet(c, "tables"); tb != nullptr && tb->is_array()) {
+			for (const auto& e: *tb) {
+				TitleProfile::Path q; // a table is listed by its pointer chain: its base is that chain + 0
+				if (JPath(&e, &q)) {
+					q.offs.push_back(0);
+					q.inline_ud = false;
+					p.taa_cal_tables.push_back(q);
+				}
+			}
+		}
+	}
+	if (const Json* oc = JGet(t, "output_consumer"); oc != nullptr && oc->is_object()) {
+		const std::string h = JStr(JGet(oc, "shader_hash"));
+		if (!h.empty() && JPath(JGet(oc, "output"), &p.taa_out_consumer_output)) p.taa_out_consumer_hash = std::strtoull(h.c_str(), nullptr, 16);
+	}
+	const std::string consumer = JStr(JGet(t, "consumer_shader_hash"));
+	p.taa_consumer_hash = consumer.empty() ? 0 : std::strtoull(consumer.c_str(), nullptr, 16);
+	p.taa_raster = p.taa_consumer_hash != 0;
+	if (const Json* hashes=JGet(t,"consumer_shader_hashes"); hashes && hashes->is_array()) {
+		for (const auto& entry:*hashes) {
+			const auto hash=JStr(&entry);
+			if (!hash.empty() && hash.size()<=16) {
+				const auto value=std::strtoull(hash.c_str(),nullptr,16);
+				if (value) p.taa_consumer_hashes.push_back(value);
+			}
+		}
+	}
+	p.taa_dynamic_framegen_only = JStr(JGet(t, "framegen_cadence")) == "dynamic_only";
+	p.taa_sizes_integer = JStr(JGet(t, "size_units")) == "uint32";
 	p.taa_jitter_uv = JStr(JGet(j, "units")) != "pixels";
 	JPath(JGet(t, "render_size"), &p.taa_render_size);
 	JPath(JGet(t, "output_size"), &p.taa_output_size);
@@ -173,7 +251,7 @@ inline TitleProfile LoadTaaBlock(TitleProfile p, const Json* r) {
 		p.taa_jitter_sign[1] = JFloat(&(*sg)[1], 1.0f);
 	}
 	const std::string mv = JStr(JGet(t, "motion_vectors"));
-	ok                   = ok && (mv == "uv_current_minus_previous" || mv == "uv_previous_minus_current");
+	ok                   = ok && (mv == "uv_current_minus_previous" || mv == "uv_previous_minus_current" || static_route);
 	p.taa_mv_sign        = mv == "uv_previous_minus_current" ? 1.0f : -1.0f;
 	if (const Json* mirror = JGet(t, "display_mirror_x"); mirror != nullptr && mirror->is_boolean()) {
 		p.taa_display_mirror_x = mirror->get<bool>();
@@ -195,12 +273,18 @@ inline TitleProfile LoadTaaBlock(TitleProfile p, const Json* r) {
 	}
 	const Json* c = JGet(t, "camera");
 	p.taa_near    = JFloat(JGet(c, "near"), p.taa_near);
+	if (const Json* lin = JGet(t, "depth_linear"); lin != nullptr && lin->is_boolean() && lin->get<bool>()) {
+		p.taa_depth_linear = true;
+		p.taa_near         = 0.1f; // the near plane copy1_rz.s and fg_guides.s convert with
+	}
 	p.taa_far     = JFloat(JGet(c, "far"), p.taa_far);
 	p.taa_fov     = JFloat(JGet(c, "fov"), p.taa_fov);
 	uint64_t flags = 0;
 	if (JU64(JGet(t, "hlx_flags"), &flags)) p.taa_hlx_flags = static_cast<uint32_t>(flags);
 	// "hudless": {"composite_shader_hash": "0x..", "scene": [ud, off...], "encoding": "srgb_a2b10g10r10"} (optional)
-	if (const Json* hl = JGet(t, "hudless"); hl != nullptr && JStr(JGet(hl, "encoding")) == "srgb_a2b10g10r10") {
+	if (const Json* hl = JGet(t, "hudless"); hl != nullptr &&
+	    (JStr(JGet(hl, "encoding")) == "srgb_a2b10g10r10" || JStr(JGet(hl, "encoding")) == "replay_a2b10g10r10")) {
+		p.taa_hl_replay = JStr(JGet(hl, "encoding")) == "replay_a2b10g10r10";
 		const std::string hh = JStr(JGet(hl, "composite_shader_hash"));
 		if (!hh.empty() && JPath(JGet(hl, "scene"), &p.taa_hl_scene)) p.taa_hl_hash = std::strtoull(hh.c_str(), nullptr, 16);
 	}
@@ -235,6 +319,9 @@ inline TitleProfile LoadProfileFile(const char* path) {
 	}
 	if (JStr(JGet(r, "adapter")) == "taa_paths_v1") {
 		return LoadTaaBlock(std::move(p), r);
+	}
+	if (JStr(JGet(r, "adapter")) == "taa_static_v1") {
+		return LoadTaaBlock(std::move(p), r, true);
 	}
 	if (JStr(JGet(r, "adapter")) != "ffx_agc_fsr3upscaler_v1") {
 		p.why = "profile adapter " + JStr(JGet(r, "adapter")) + " is not implemented in this build";

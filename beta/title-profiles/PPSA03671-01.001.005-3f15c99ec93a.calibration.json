@@ -1,0 +1,21 @@
+{
+ "depth_inverted": false,
+ "exposure": null,
+ "jitter": {
+  "block": "buffer",
+  "dword": 46,
+  "path": [
+   12,
+   240
+  ],
+  "units": "pixels"
+ },
+ "motion_vectors": {
+  "sx": -1,
+  "sy": -1,
+  "units": "pixels"
+ },
+ "schema": "kyty-taa-calibration",
+ "sha256": "3f15c99ec93aaf827b2d0338ee730400be12ebc7c20ebfe76773597d015f5497",
+ "shader_hash": "4392398e1aad9cf5"
+}

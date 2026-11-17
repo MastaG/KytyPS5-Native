@@ -243,6 +243,54 @@ PY
 ) || true
     fi
 fi
+# Marvel's Wolverine: the static scan does not find its temporal upscaler (the resolve was found at run time), so the
+# package carries the tested profile (upscalers/title-profiles) for the executable it was made with. It is used only
+# when this copy's executable is that one (same SHA-256 as the scan's); a copy into the profile folder keeps the
+# calibration the emulator caches next to it. The render presets fix the render size; Dynamic keeps the game's own.
+title_profiles="$bundle_root/upscalers/title-profiles"
+if [[ "$astro_manual" == "0" && "$up_build" == "1" && "$mode" == upstream && "$content_title" == PPSA03671 &&
+      -n "$up_profile" && -f "$up_profile" ]]; then
+    tested="$(python3 -I - "$up_profile" "$title_profiles" <<'PY'
+import json, sys, pathlib
+try:
+    sha = json.load(open(sys.argv[1], encoding='utf-8'))['game']['sha256']
+    for p in sorted(pathlib.Path(sys.argv[2]).glob('PPSA03671-*.json')):
+        d = json.load(open(p, encoding='utf-8'))
+        if isinstance(d, dict) and d.get('schema') == 'kyty-upscaler-profile' and d.get('game', {}).get('sha256') == sha:
+            print(p)
+            break
+except (OSError, ValueError, KeyError, TypeError):
+    pass
+PY
+)" || tested=
+    if [[ -n "$tested" ]]; then
+        tested_copy="$(dirname -- "$up_profile")/$(basename -- "$tested" .json).tested.json"
+        # The tested calibration (jitter, motion vectors) as the first cache: the first launch starts calibrated.
+        tested_cal="${tested%.json}.calibration.json"
+        if [[ -f "$tested_cal" && ! -f "${tested_copy%.json}.calibration.json" ]]; then
+            cp -f -- "$tested_cal" "${tested_copy%.json}.calibration.json" 2>/dev/null || true
+        fi
+        if cp -f -- "$tested" "$tested_copy" 2>/dev/null; then
+            up_profile="$tested_copy" up_state=available up_fg_state=available up_adapter=taa_static_v1
+            # Render presets (make-wolverine-presets.py): a fixed size for every step of the game's dynamic resolution,
+            # upscaled to 4K (Ultra Quality 2816x1584, Quality 2560x1440, Balanced 2304x1296, Performance 1920x1080,
+            # Ultra Performance 1664x936). Dynamic keeps the game's own resolution range.
+            case "$up_preset" in
+                # At 2560x1440 the game switches to another upscaler pass when play starts, which the profile does not
+                # cover yet (HLX and frame generation would stop): Quality runs as Balanced for now.
+                quality) wolverine_preset=balanced
+                         echo "[Kyty launcher] Marvel's Wolverine: the Quality preset runs as Balanced (2304x1296) for now." >&2 ;;
+                ultra_quality|balanced|performance|ultra_performance) wolverine_preset="${up_preset//_/-}" ;;
+                *) wolverine_preset=none ;;
+            esac
+            wolverine_drs="$title_profiles/$(basename -- "$tested" | cut -d- -f1-2)-$wolverine_preset.json"
+            if [[ "$up_kind" != game && -f "$wolverine_drs" ]]; then export KYTY_RENDER_PRESET_PATCH="$wolverine_drs"; fi
+            echo "[Kyty launcher] Marvel's Wolverine: the package's tested upscaler profile ($(basename -- "$tested"))." >&2
+        fi
+    else
+        echo "[Kyty launcher] Marvel's Wolverine: this copy's executable is not the one the package's upscaler profile was tested with; the game keeps its own upscaler." >&2
+    fi
+fi
 if [[ "$up_state" == "available" ]]; then
     selected="$auto_binary"
     if [[ "$astro_manual" == "1" ]]; then selected="$astro_binary";
@@ -269,7 +317,8 @@ fi
 
 # Some TAA titles expose their render size through startup constants rather than a live DRS controller. Apply
 # the scanned profile's selected preset before render-graph construction, independently of --game-patch cheats.
-if [[ ( "$selected" == "$auto_binary" || "$selected" == "$taa_binary" ) && -n "$up_profile" && "$up_kind" != game ]]; then
+if [[ ( "$selected" == "$auto_binary" || "$selected" == "$taa_binary" ) && -n "$up_profile" && "$up_kind" != game &&
+      -z "${wolverine_drs:-}" ]]; then
     preset_tool="$(dirname -- "$scanner")/kyty-render-preset"
     if [[ -f "$preset_tool" ]]; then
         if preset_plan="$(python3 -I "$preset_tool" --profile "$up_profile" --preset "$up_preset")"; then

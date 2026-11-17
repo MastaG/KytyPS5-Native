@@ -172,7 +172,12 @@ struct Generator::Impl {
 	OwnedImage       depth, motion, flow_color;
 	// The frame without its UI (NativeUpscaler FgFrame::hudless; titles whose profile names their UI composite): FSR's
 	// currentBackBuffer_HUDLess, optical flow's and the vector check's source. Display format A2B10G10R10 only.
-	OwnedImage       hudless;
+	OwnedImage       hudless_images[2], hudless_full;
+	unsigned         hudless_index = 0;
+	OwnedImage& Hudless() { return hudless_images[hudless_index]; }
+	OwnedImage& PreviousHudless() { return hudless_images[hudless_index ^ 1u]; }
+	OwnedImage       working_current, working_previous, working_output;
+	bool             hudless_previous_valid = false;
 	bool             hudless_valid = false;
 
 	// Motion-vector check (fgMvCheck.comp; KYTY_FRAMEGEN_MV_CHECK=0 turns it off): the real frames at guide size
@@ -231,17 +236,24 @@ struct Generator::Impl {
 		i.layout = vk::ImageLayout::eUndefined;
 	}
 	void Destroy(bool all) {
-		if (created || depth.image.image != nullptr || (all && buffer)) {
+		if (created || depth.image.image != nullptr || (all && (buffer || working_current.image.image != nullptr ||
+		    working_previous.image.image != nullptr || working_output.image.image != nullptr))) {
 			WaitIdle();
 		}
 		DestroyContexts();
 		MvCheckDestroy();
-		DestroyImage(hudless);
+		DestroyImage(Hudless());
+		DestroyImage(PreviousHudless());
+		DestroyImage(hudless_full);
+		hudless_previous_valid = false;
 		hudless_valid = false;
 		DestroyImage(depth);
 		DestroyImage(motion);
 		DestroyImage(flow_color);
 		if (all) {
+			DestroyImage(working_current);
+			DestroyImage(working_previous);
+			DestroyImage(working_output);
 			if (buffer) g.device.destroyBuffer(buffer);
 			if (memory) g.device.freeMemory(memory);
 			buffer = nullptr;
@@ -573,9 +585,13 @@ struct Generator::Impl {
 		const vk::Extent2D cap = render;
 		Destroy(false);
 		const auto read = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst;
+		static const uint32_t flow_divisor = [] {
+			const char* v = std::getenv("KYTY_FRAMEGEN_OPTICAL_FLOW_DIVISOR");
+			return v != nullptr && std::strcmp(v, "4") == 0 ? 4u : 2u;
+		}();
 		if (!MakeImage(depth, vk::Format::eR32Sfloat, cap, read) ||
 		    !MakeImage(motion, vk::Format::eR16G16Sfloat, cap, read | vk::ImageUsageFlagBits::eStorage) ||
-		    !MakeImage(flow_color, real.format, {std::max(real.extent.width / 2u, 1u), std::max(real.extent.height / 2u, 1u)}, read)) {
+		    !MakeImage(flow_color, real.format, {std::max(real.extent.width / flow_divisor, 1u), std::max(real.extent.height / flow_divisor, 1u)}, read)) {
 			Report("image allocation failed; off\n");
 			failed = true;
 			return false;
@@ -620,11 +636,13 @@ struct Generator::Impl {
 		KYTY_FG_CHECK(b.fpCreateResource(&b, &resources.dilatedMotionVectors, shared, &dilated_motion));
 		KYTY_FG_CHECK(b.fpCreateResource(&b, &resources.reconstructedPrevNearestDepth, shared, &previous_depth));
 		if (real.format == vk::Format::eA2B10G10R10UnormPack32 &&
-		    !MakeImage(hudless, real.format, real.extent,
+		    !MakeImage(Hudless(), real.format, real.extent,
 		               vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled)) {
 			Report("HUD-less image unavailable\n");
-			DestroyImage(hudless);
+			DestroyImage(Hudless());
 		}
+		if (Hudless().image.image != nullptr && !MakeImage(PreviousHudless(), real.format, real.extent,
+		    vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled)) DestroyImage(PreviousHudless());
 		if (MvCheckWanted() && !MvCheckCreate(real.format, cap)) {
 			Report("motion-vector check unavailable (its resources could not be created)\n");
 			MvCheckDestroy();
@@ -661,6 +679,10 @@ struct Generator::Impl {
 			return false;
 		}
 		pending_set = f.set;
+		if (WorkingHeight() != 0 && f.output_h > real.extent.height) {
+			CopyInputs(command, real, f);
+			return true;
+		}
 
 		// The native GPU wrote the guides through its own mappings; its EOP passed before this flip.
 		vk::BufferMemoryBarrier2 bb {};
@@ -695,10 +717,10 @@ struct Generator::Impl {
 		copy(depth, f.depth);
 		copy(motion, f.motion);
 		// The HUD-less frame (this frame's, saved at the title's UI composite) when there is one: what is interpolated.
-		hudless_valid = f.hudless_ok && hudless.image.image != nullptr && f.hudless.width == real.extent.width &&
+		hudless_valid = f.hudless_ok && Hudless().image.image != nullptr && f.hudless.width == real.extent.width &&
 		                f.hudless.height == real.extent.height;
 		if (hudless_valid) {
-			Barrier(command, hudless.image.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+			Barrier(command, Hudless().image.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
 			        vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead, vk::PipelineStageFlagBits2::eTransfer,
 			        vk::AccessFlagBits2::eTransferWrite);
 			vk::BufferImageCopy region {};
@@ -706,12 +728,12 @@ struct Generator::Impl {
 			region.bufferRowLength   = f.hudless.pitch;
 			region.imageSubresource  = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
 			region.imageExtent       = vk::Extent3D {f.hudless.width, f.hudless.height, 1};
-			command.copyBufferToImage(buffer, hudless.image.image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
-			Barrier(command, hudless.image.image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal,
+			command.copyBufferToImage(buffer, Hudless().image.image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
+			Barrier(command, Hudless().image.image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal,
 			        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eTransfer,
 			        vk::AccessFlagBits2::eTransferRead);
 		}
-		const Target source = hudless_valid ? Target {hudless.image.image, real.format, real.extent, real.usage, real.guides} : real;
+		const Target source = hudless_valid ? Target {Hudless().image.image, real.format, real.extent, real.usage, real.guides} : real;
 		// Optical flow's half-size frame (linear filter: a 2x2 box at exactly half).
 		vk::ImageBlit blit {};
 		blit.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
@@ -728,15 +750,72 @@ struct Generator::Impl {
 		}
 		MvCheckRecord(command, source, f); // (the title's vectors against the image: see fgMvCheck.comp)
 		if (hudless_valid) {
-			Barrier(command, hudless.image.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+			Barrier(command, Hudless().image.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
 			        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eComputeShader,
 			        vk::AccessFlagBits2::eShaderRead);
-			hudless.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+			Hudless().layout = vk::ImageLayout::eShaderReadOnlyOptimal;
 		}
 		return true;
 	}
 
+	static uint32_t WorkingHeight() {
+		static const uint32_t h = [] { const char* v = std::getenv("KYTY_FRAMEGEN_WORKING_HEIGHT");
+			const unsigned n = v ? static_cast<unsigned>(std::atoi(v)) : 0u;
+			return n == 720 || n == 1080 || n == 1440 ? n : 0u; }();
+		return h;
+	}
+	bool UsesWorking(const Target& real) const { return WorkingHeight() != 0 && real.extent.height > WorkingHeight(); }
+	bool WorkingImage(OwnedImage& i, vk::Format f, vk::Extent2D e, bool storage = false) {
+		if (i.image.image != nullptr && i.info.extent.width == e.width && i.info.extent.height == e.height && i.info.format == static_cast<VkFormat>(f)) return true;
+		if (i.image.image != nullptr) { WaitIdle(); DestroyImage(i); }
+		return MakeImage(i, f, e, vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+			vk::ImageUsageFlagBits::eSampled | (storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {}));
+	}
+	void Blit(vk::CommandBuffer command, vk::Image src, vk::Extent2D se, vk::Image dst, vk::Extent2D de) {
+		vk::ImageBlit b {};
+		b.srcSubresource = b.dstSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		b.srcOffsets[1] = vk::Offset3D {static_cast<int32_t>(se.width), static_cast<int32_t>(se.height), 1};
+		b.dstOffsets[1] = vk::Offset3D {static_cast<int32_t>(de.width), static_cast<int32_t>(de.height), 1};
+		command.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst, vk::ImageLayout::eTransferDstOptimal, b, vk::Filter::eLinear);
+	}
+	bool Downsample(vk::CommandBuffer command, const Target& src, OwnedImage& dst, vk::ImageLayout source_layout,
+	                vk::ImageLayout result_layout, Target* result) {
+		const vk::Extent2D e {static_cast<uint32_t>(static_cast<uint64_t>(src.extent.width) * WorkingHeight() / src.extent.height), WorkingHeight()};
+		if (!WorkingImage(dst, src.format, e)) return false;
+		using S = vk::PipelineStageFlagBits2; using A = vk::AccessFlagBits2; using L = vk::ImageLayout;
+		if (source_layout != L::eTransferSrcOptimal) Barrier(command, src.image, source_layout, L::eTransferSrcOptimal, S::eAllCommands, A::eMemoryRead | A::eMemoryWrite, S::eTransfer, A::eTransferRead);
+		Barrier(command, dst.image.image, dst.layout, L::eTransferDstOptimal, S::eAllCommands, A::eMemoryRead | A::eMemoryWrite, S::eTransfer, A::eTransferWrite);
+		Blit(command, src.image, src.extent, dst.image.image, e);
+		Barrier(command, dst.image.image, L::eTransferDstOptimal, result_layout, S::eTransfer, A::eTransferWrite, S::eAllCommands, A::eMemoryRead);
+		dst.layout = result_layout;
+		if (source_layout != L::eTransferSrcOptimal) Barrier(command, src.image, L::eTransferSrcOptimal, source_layout, S::eTransfer, A::eTransferRead, S::eAllCommands, A::eMemoryRead);
+		*result = {dst.image.image, src.format, e, dst.image.usage, src.guides};
+		return true;
+	}
+
 	// The guides into Kyty's images and the half-size copy of `real` (TRANSFER_SRC_OPTIMAL) for optical flow.
+	bool WorkingRecord(vk::CommandBuffer command, const Target& real, const Target& output, bool fixed, float phase = 0.5f) {
+	auto& i = *this;
+	const vk::Extent2D e {i.working_current.info.extent.width, i.working_current.info.extent.height};
+	if (!i.WorkingImage(i.working_output, output.format, e, true)) return false;
+	using S = vk::PipelineStageFlagBits2; using A = vk::AccessFlagBits2; using L = vk::ImageLayout;
+	Barrier(command, i.working_current.image.image, i.working_current.layout, L::eShaderReadOnlyOptimal,
+	    S::eAllCommands, A::eMemoryRead | A::eMemoryWrite, S::eComputeShader, A::eShaderRead);
+	i.working_current.layout = L::eShaderReadOnlyOptimal;
+	Barrier(command, i.working_output.image.image, i.working_output.layout, L::eGeneral,
+	    S::eAllCommands, A::eMemoryRead | A::eMemoryWrite, S::eComputeShader, A::eShaderWrite);
+	const Target cur {i.working_current.image.image, real.format, e, i.working_current.image.usage, real.guides};
+	const Target out {i.working_output.image.image, output.format, e, i.working_output.image.usage};
+	i.working_output.layout = L::eGeneral;
+	if (!(fixed ? i.Record(command, cur, out) : i.Generate(command, cur, out, phase))) return false;
+	Barrier(command, i.working_output.image.image, L::eGeneral, L::eTransferSrcOptimal, S::eComputeShader, A::eShaderWrite, S::eTransfer, A::eTransferRead);
+	i.working_output.layout = L::eTransferSrcOptimal;
+	Barrier(command, output.image, L::eGeneral, L::eTransferDstOptimal, S::eAllCommands, A::eMemoryRead | A::eMemoryWrite, S::eTransfer, A::eTransferWrite);
+	i.Blit(command, i.working_output.image.image, e, output.image, output.extent);
+	Barrier(command, output.image, L::eTransferDstOptimal, L::eGeneral, S::eTransfer, A::eTransferWrite, S::eAllCommands, A::eMemoryRead | A::eMemoryWrite);
+	return true;
+	}
+
 	void CopyInputs(vk::CommandBuffer command, const Target& real, const NativeUpscaler::FgFrame& f) {
 		vk::BufferMemoryBarrier2 bb {};
 		bb.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -769,18 +848,39 @@ struct Generator::Impl {
 		};
 		copy(depth, f.depth);
 		copy(motion, f.motion);
+		hudless_previous_valid = hudless_valid;
+		hudless_index ^= 1u;
+		hudless_valid = false;
+		using S = vk::PipelineStageFlagBits2; using A = vk::AccessFlagBits2; using L = vk::ImageLayout;
+		if (f.hudless_ok && Hudless().image.image != nullptr && WorkingImage(hudless_full, real.format, {f.hudless.width, f.hudless.height})) {
+			Barrier(command, hudless_full.image.image, hudless_full.layout, L::eTransferDstOptimal, S::eAllCommands, A::eMemoryRead | A::eMemoryWrite, S::eTransfer, A::eTransferWrite);
+			copy(hudless_full, f.hudless);
+			Barrier(command, hudless_full.image.image, L::eTransferDstOptimal, L::eTransferSrcOptimal, S::eTransfer, A::eTransferWrite, S::eTransfer, A::eTransferRead);
+			Barrier(command, Hudless().image.image, Hudless().layout, L::eTransferDstOptimal, S::eAllCommands, A::eMemoryRead | A::eMemoryWrite, S::eTransfer, A::eTransferWrite);
+			Blit(command, hudless_full.image.image, {f.hudless.width, f.hudless.height}, Hudless().image.image, real.extent);
+			Barrier(command, hudless_full.image.image, L::eTransferSrcOptimal, L::eShaderReadOnlyOptimal, S::eTransfer, A::eTransferRead, S::eAllCommands, A::eMemoryRead);
+			hudless_full.layout = L::eShaderReadOnlyOptimal;
+			Barrier(command, Hudless().image.image, L::eTransferDstOptimal, L::eTransferSrcOptimal, S::eTransfer, A::eTransferWrite, S::eTransfer, A::eTransferRead);
+			Hudless().layout = L::eTransferSrcOptimal;
+			hudless_valid = true;
+		}
+		const Target source = hudless_valid ? Target {Hudless().image.image, real.format, real.extent, Hudless().image.usage, real.guides} : real;
 		vk::ImageBlit blit {};
 		blit.srcSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
 		blit.dstSubresource = blit.srcSubresource;
 		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(real.extent.width), static_cast<int32_t>(real.extent.height), 1};
 		blit.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(flow_color.info.extent.width), static_cast<int32_t>(flow_color.info.extent.height), 1};
-		command.blitImage(real.image, vk::ImageLayout::eTransferSrcOptimal, flow_color.image.image, vk::ImageLayout::eTransferDstOptimal, 1,
+		command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal, flow_color.image.image, vk::ImageLayout::eTransferDstOptimal, 1,
 		                  &blit, vk::Filter::eLinear);
 		for (auto* i: {&depth, &motion, &flow_color}) {
 			Barrier(command, i->image.image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
 			        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
 			        vk::AccessFlagBits2::eShaderRead);
 			i->layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+		}
+		if (hudless_valid) {
+			Barrier(command, Hudless().image.image, L::eTransferSrcOptimal, L::eShaderReadOnlyOptimal, S::eTransfer, A::eTransferRead, S::eAllCommands, A::eMemoryRead);
+			Hudless().layout = L::eShaderReadOnlyOptimal;
 		}
 	}
 
@@ -809,7 +909,8 @@ struct Generator::Impl {
 		const auto list = ffxGetCommandListVK(static_cast<VkCommandBuffer>(command));
 		const bool cont = prev != nullptr && !pair_reset && !reset;
 		if (cont) {
-			const auto pr = ToResource(prev->image, InfoOf(prev->format, prev->extent, prev->usage), L"KytyFgPrevious", false);
+			const auto pr = hudless_previous_valid ? ToResource(PreviousHudless().image.image, PreviousHudless().info, L"KytyFgPreviousHudless", false)
+			    : ToResource(prev->image, InfoOf(prev->format, prev->extent, prev->usage), L"KytyFgPrevious", false);
 			KYTY_FG_CHECK2(ffxFrameInterpolationKytyStorePrevious(&interpolation, list, &pr));
 		}
 		pair_id = ++frame_id;
@@ -855,6 +956,7 @@ struct Generator::Impl {
 		d.displaySize                     = {display.width, display.height};
 		d.renderSize                      = {f.depth.width, f.depth.height};
 		d.currentBackBuffer               = ToResource(real.image, InfoOf(real.format, real.extent, real.usage), L"KytyFgColor", false);
+		if (hudless_valid) d.currentBackBuffer_HUDLess = ToResource(Hudless().image.image, Hudless().info, L"KytyFgHudless", false);
 		d.output                          = ToResource(output.image, InfoOf(output.format, output.extent, output.usage), L"KytyFgOutput", true);
 		d.interpolationRect               = {0, 0, static_cast<int32_t>(display.width), static_cast<int32_t>(display.height)};
 		d.opticalFlowVector               = fv;
@@ -929,7 +1031,7 @@ struct Generator::Impl {
 		d.renderSize                      = {f.depth.width, f.depth.height};
 		d.currentBackBuffer               = color;
 		if (hudless_valid) { // FSR interpolates this and takes the UI from the real frame where they differ
-			d.currentBackBuffer_HUDLess = ToResource(hudless.image.image, hudless.info, L"KytyFgHudless", false);
+			d.currentBackBuffer_HUDLess = ToResource(Hudless().image.image, Hudless().info, L"KytyFgHudless", false);
 		}
 		d.output                          = out;
 		d.interpolationRect               = {0, 0, static_cast<int32_t>(display.width), static_cast<int32_t>(display.height)};
@@ -1075,7 +1177,8 @@ struct Generator::Impl {
 		d.gh          = f.depth.height;
 		d.bytes[0] = d.bytes[1] = static_cast<uint64_t>(d.w) * d.h * 4u;
 		d.bytes[2] = d.bytes[3] = static_cast<uint64_t>(d.gw) * d.gh * 4u;
-		d.hudless  = hudless_valid;
+		const vk::Image dump_hudless = hudless_full.image.image != nullptr ? hudless_full.image.image : Hudless().image.image;
+		d.hudless  = hudless_valid && dump_hudless != nullptr;
 		d.bytes[4] = d.hudless ? static_cast<uint64_t>(d.w) * d.h * 4u : 0u;
 		uint64_t total = 0;
 		for (int i = 0; i < 5; i++) {
@@ -1093,7 +1196,7 @@ struct Generator::Impl {
 		using L = vk::ImageLayout;
 		Barrier(command, real.image, L::eShaderReadOnlyOptimal, L::eTransferSrcOptimal, S::eComputeShader, A::eShaderRead, S::eTransfer,
 		        A::eTransferRead);
-		Barrier(command, output.image, L::eGeneral, L::eGeneral, S::eComputeShader, A::eShaderWrite, S::eTransfer, A::eTransferRead);
+		Barrier(command, output.image, L::eGeneral, L::eGeneral, S::eAllCommands, A::eMemoryWrite, S::eTransfer, A::eTransferRead);
 		Barrier(command, depth.image.image, L::eShaderReadOnlyOptimal, L::eTransferSrcOptimal, S::eComputeShader, A::eShaderRead,
 		        S::eTransfer, A::eTransferRead);
 		Barrier(command, motion.image.image, L::eShaderReadOnlyOptimal, L::eTransferSrcOptimal, S::eComputeShader, A::eShaderRead,
@@ -1110,10 +1213,10 @@ struct Generator::Impl {
 		copy(depth.image.image, L::eTransferSrcOptimal, d.gw, d.gh, d.off[2]);
 		copy(motion.image.image, L::eTransferSrcOptimal, d.gw, d.gh, d.off[3]);
 		if (d.hudless) {
-			Barrier(command, hudless.image.image, L::eShaderReadOnlyOptimal, L::eTransferSrcOptimal, S::eComputeShader, A::eShaderRead,
+			Barrier(command, dump_hudless, L::eShaderReadOnlyOptimal, L::eTransferSrcOptimal, S::eComputeShader, A::eShaderRead,
 			        S::eTransfer, A::eTransferRead);
-			copy(hudless.image.image, L::eTransferSrcOptimal, d.w, d.h, d.off[4]);
-			Barrier(command, hudless.image.image, L::eTransferSrcOptimal, L::eShaderReadOnlyOptimal, S::eTransfer, A::eTransferRead,
+			copy(dump_hudless, L::eTransferSrcOptimal, d.w, d.h, d.off[4]);
+			Barrier(command, dump_hudless, L::eTransferSrcOptimal, L::eShaderReadOnlyOptimal, S::eTransfer, A::eTransferRead,
 			        S::eComputeShader, A::eShaderRead);
 		}
 		Barrier(command, real.image, L::eTransferSrcOptimal, L::eShaderReadOnlyOptimal, S::eTransfer, A::eTransferRead,
@@ -1203,18 +1306,30 @@ void Generator::DropGuides(const NativeUpscaler::FgFrame& guides) {
 }
 bool Generator::Advance(vk::CommandBuffer command, const Target* prev, const Target& real, const NativeUpscaler::FgFrame& guides,
                         bool reset) {
-	return m_impl->Advance(command, prev, real, guides, reset);
+	if (!m_impl->UsesWorking(real)) return m_impl->Advance(command, prev, real, guides, reset);
+	Target current {}, previous {};
+	if (!m_impl->Downsample(command, real, m_impl->working_current, vk::ImageLayout::eTransferSrcOptimal,
+	    vk::ImageLayout::eTransferSrcOptimal, &current) || (prev != nullptr && !m_impl->Downsample(command, *prev,
+	    m_impl->working_previous, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageLayout::eShaderReadOnlyOptimal, &previous))) {
+		NativeUpscaler::FgRelease(guides.set); return false;
+	}
+	return m_impl->Advance(command, prev != nullptr ? &previous : nullptr, current, guides, reset);
 }
 bool Generator::Generate(vk::CommandBuffer command, const Target& real, const Target& output, float phase) {
-	return m_impl->Generate(command, real, output, phase);
+	return m_impl->UsesWorking(real) ? m_impl->WorkingRecord(command, real, output, false, phase)
+	                               : m_impl->Generate(command, real, output, phase);
 }
 Generator::~Generator() = default;
 
 bool Generator::Begin(vk::CommandBuffer command, const Target& real) {
-	return m_impl->Begin(command, real);
+	if (!m_impl->UsesWorking(real)) return m_impl->Begin(command, real);
+	Target small {};
+	return m_impl->Downsample(command, real, m_impl->working_current, vk::ImageLayout::eTransferSrcOptimal,
+	                         vk::ImageLayout::eTransferSrcOptimal, &small) && m_impl->Begin(command, small);
 }
 bool Generator::Record(vk::CommandBuffer command, const Target& real, const Target& output) {
-	return m_impl->Record(command, real, output);
+	return m_impl->UsesWorking(real) ? m_impl->WorkingRecord(command, real, output, true)
+	                               : m_impl->Record(command, real, output);
 }
 void Generator::Submitted(uint64_t tick) {
 	if (m_impl->pending_set >= 0) {
