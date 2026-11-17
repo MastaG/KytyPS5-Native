@@ -272,19 +272,25 @@ PY
         fi
         if cp -f -- "$tested" "$tested_copy" 2>/dev/null; then
             up_profile="$tested_copy" up_state=available up_fg_state=available up_adapter=taa_static_v1
-            # Render presets (make-wolverine-presets.py): a fixed size for every step of the game's dynamic resolution,
-            # upscaled to 4K (Ultra Quality 2816x1584, Quality 2560x1440, Balanced 2304x1296, Performance 1920x1080,
-            # Ultra Performance 1664x936). Dynamic keeps the game's own resolution range.
+            # HLX upscales to the game's own target (4K / 1440p, see below); a smaller HLX output would only be scaled
+            # back up into it. The output choice still sets the window (the presenter scales to the display).
+            up_output=
+            # Render presets (wolverine-render-preset.py): each graphics mode renders at its own target / the preset's
+            # ratio (Fidelity and the menus upscale to 3840x2160, Performance to 2560x1440, whatever the window size;
+            # the output choice only scales the window), always below the target (Native AA one step below).
+            # Dynamic keeps the game's own resolution range.
+            wolverine_drs=
             case "$up_preset" in
-                # At 2560x1440 the game switches to another upscaler pass when play starts, which the profile does not
-                # cover yet (HLX and frame generation would stop): Quality runs as Balanced for now.
-                quality) wolverine_preset=balanced
-                         echo "[Kyty launcher] Marvel's Wolverine: the Quality preset runs as Balanced (2304x1296) for now." >&2 ;;
-                ultra_quality|balanced|performance|ultra_performance) wolverine_preset="${up_preset//_/-}" ;;
-                *) wolverine_preset=none ;;
+                dlaa|ultra_quality|quality|balanced|performance|ultra_performance)
+                    wolverine_drs="$(dirname -- "$up_profile")/PPSA03671-render-${up_preset}.json"
+                    if ! wolverine_sizes="$(python3 -I "$title_profiles/wolverine-render-preset.py" "$up_preset" "$wolverine_drs")"; then
+                        echo "[Kyty launcher] Marvel's Wolverine: the $up_preset render preset could not be prepared; the game keeps its own resolution." >&2
+                        wolverine_drs=
+                    else
+                        echo "[Kyty launcher] Marvel's Wolverine: $up_preset renders Fidelity at ${wolverine_sizes% *} (to 3840x2160) and Performance at ${wolverine_sizes#* } (to 2560x1440)." >&2
+                    fi ;;
             esac
-            wolverine_drs="$title_profiles/$(basename -- "$tested" | cut -d- -f1-2)-$wolverine_preset.json"
-            if [[ "$up_kind" != game && -f "$wolverine_drs" ]]; then export KYTY_RENDER_PRESET_PATCH="$wolverine_drs"; fi
+            if [[ "$up_kind" != game && -n "$wolverine_drs" && -f "$wolverine_drs" ]]; then export KYTY_RENDER_PRESET_PATCH="$wolverine_drs"; fi
             echo "[Kyty launcher] Marvel's Wolverine: the package's tested upscaler profile ($(basename -- "$tested"))." >&2
         fi
     else
@@ -318,7 +324,7 @@ fi
 # Some TAA titles expose their render size through startup constants rather than a live DRS controller. Apply
 # the scanned profile's selected preset before render-graph construction, independently of --game-patch cheats.
 if [[ ( "$selected" == "$auto_binary" || "$selected" == "$taa_binary" ) && -n "$up_profile" && "$up_kind" != game &&
-      -z "${wolverine_drs:-}" ]]; then
+      "$content_title" != PPSA03671 ]]; then
     preset_tool="$(dirname -- "$scanner")/kyty-render-preset"
     if [[ -f "$preset_tool" ]]; then
         if preset_plan="$(python3 -I "$preset_tool" --profile "$up_profile" --preset "$up_preset")"; then

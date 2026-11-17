@@ -38,7 +38,7 @@ OVERLAY = {
     **{'beta/astro-templates/' + f.name: 'upscalers/astro-templates/' + f.name
        for f in sorted((Path(__file__).resolve().parents[1] / 'astro-templates').glob('*.json'))},
     **{'beta/title-profiles/' + f.name: 'upscalers/title-profiles/' + f.name
-       for f in sorted((Path(__file__).resolve().parents[1] / 'title-profiles').glob('*.json'))},
+       for f in sorted((Path(__file__).resolve().parents[1] / 'title-profiles').glob('*')) if f.suffix in ('.json', '.py')},
     **{'beta/title-defaults/' + f.name: 'title-defaults/' + f.name
        for f in sorted((Path(__file__).resolve().parents[1] / 'title-defaults').glob('*.json'))},
 }
@@ -55,12 +55,12 @@ CHANGES = [
     "copy for the presenter and DCC metadata is reset after a title's DCC clear (Gran Turismo 7's black replays), game "
     "patches move console addresses in their code",
     "Marvel's Wolverine with HLX and frame generation: the package carries the tested upscaler profile and calibration "
-    "for the game's 01.001.005 executable (the scan does not find its upscaler pass) and fixed 4K render presets "
-    "(Ultra Quality 2816x1584, Balanced 2304x1296, Performance 1920x1080); the HLX helper takes the game's 11:11:10 "
-    "float colour and 16-bit float depth",
-    "Marvel's Wolverine starts with HLX FSR 4, the Balanced preset (2304x1296 upscaled to 4K) and FSR 3 frame "
-    "generation; its Quality preset runs as Balanced for now (at 2560x1440 the game switches to an upscaler pass the "
-    "profile does not cover yet)",
+    "for the game's 01.001.005 executable (the scan does not find its upscaler pass); the HLX helper takes the game's "
+    "11:11:10 float colour and 16-bit float depth",
+    "Marvel's Wolverine starts with HLX FSR 4, the Balanced preset and FSR 3 frame generation. Every render preset "
+    "(Native AA, Ultra Quality, Quality, Balanced, Performance, Ultra Performance) works in both graphics modes: each "
+    "mode renders at its own target divided by the preset's ratio (Fidelity upscales to 3840x2160, Performance to "
+    "2560x1440, which the game stretches to its 4K output), and every output size scales that 4K image to the window",
     "Frame generation keeps running when a game stops drawing its video-out buffers in a way the emulator watches "
     "(Wolverine's gameplay), and linear view depth is converted for HLX and frame generation (no ghosting around "
     "moving characters)",
