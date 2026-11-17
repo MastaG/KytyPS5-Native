@@ -8,4 +8,4 @@ so these are starting values the player can change in the game's settings.
 | PPSA26344.json | Ghost of Yōtei 02.002.000 | HLX FSR 4, Quality preset, 4K output, FSR 3 frame generation |
 | PPSA21567.json | ASTRO BOT 01.018.000 (EU) | HLX FSR 4, Performance preset, FSR 3 frame generation |
 | PPSA01341.json | Demon's Souls 01.007.000 | Scream assertion recovery on |
-| PPSA03671.json | Marvel's Wolverine 01.001.005 | HLX FSR 4, Balanced preset (Fidelity 2240x1260, Performance 1472x828), 4K output, FSR 3 frame generation |
+| PPSA03671.json | Marvel's Wolverine 01.001.005 | HLX FSR 4, Balanced preset (Fidelity 2176x1224, Performance 1408x792; with frame generation every preset renders Fidelity at most 2176x1224), 4K output, FSR 3 frame generation |
