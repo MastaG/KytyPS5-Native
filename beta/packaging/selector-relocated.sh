@@ -46,11 +46,11 @@ if [[ "$mode" == "upstream" ]]; then
     # The earlier selector silently fell back to an old Demon\'s Souls renderer.
     # NEVER make that substitution in this clean upstream profile.
     selected="$upstream"
-    if [[ "$scream_title" == "PPSA01341" && "$scream_requested" == "1" ]]; then
-        selected="$upstream_guard"
-        if [[ "$audio_test" == "dialogue" ]]; then
-            selected="$audio_binary"
-        fi
+    # Demon's Souls' Scream assertion recovery is part of the main backends now (loader/demonsScreamRecovery.h): it
+    # runs on them with the newest fixes, armed by the variables below. The separate guard build stays only for the
+    # dialogue audio test.
+    if [[ "$scream_title" == "PPSA01341" && "$scream_requested" == "1" && "$audio_test" == "dialogue" ]]; then
+        selected="$audio_binary"
     fi
 
     # The custom SharpEmu bridge currently exports KFD=0, partial GEM residency,
@@ -61,7 +61,7 @@ if [[ "$mode" == "upstream" ]]; then
             KYTY_*|ENABLE_LSFGVK|LSFGVK_*) unset "$name" ;;
         esac
     done < <(compgen -e)
-    if [[ "$selected" == "$upstream_guard" || "$selected" == "$audio_binary" ]]; then
+    if [[ "$scream_title" == "PPSA01341" && "$scream_requested" == "1" ]]; then
         export KYTY_DEMONS_SCREAM_ASSERT_RECOVERY=1 KYTY_BC250_TITLE_ID=PPSA01341
         if [[ "$selected" == "$audio_binary" ]]; then export KYTY_BC250_AUDIO_TEST=dialogue; fi
     fi
