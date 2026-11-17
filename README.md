@@ -47,6 +47,7 @@ installer, if you use it).
 | Hardware | AMD BC-250 (GPU `1002:13fe`). Ordinary PC GPUs are not supported. |
 | BIOS | **512 MB UMA / VRAM.** On the modded P3.00 "Chipset Menu" BIOS: *Chipset → GFX Configuration → UMA Frame Buffer Size → 512M*. On the stock BIOS, set it without flashing with [bc250_memcfg](https://github.com/fanoush/bc250_memcfg): `sudo ./bc250memcfg UMA_SIZE 512`. More VRAM takes RAM that games need. |
 | System | SteamOS 3.9 (tested: 3.9.5), CachyOS (tested), or another x86-64 Linux with glibc 2.38+, a working amdgpu/Mesa (RADV) stack and systemd. |
+| GPU driver | **The patched BC-250 amdgpu with its compute units unlocked: 36 or more active** (40 on most boards, 36 or 38 on some; the stock driver leaves 24, about 60% of the GPU). See [Patched amdgpu](#required-patched-amdgpu-all-compute-units). `--doctor` checks it. |
 | RAM | 16 GB (the BC-250's). Large games use about 13–14 GB of it; see [Memory](#memory-why-the-session-matters). |
 | Disk | About 2.5 GB for KytyPS5, plus your games. |
 
@@ -94,18 +95,21 @@ Install [cyan-skillfish-governor](https://github.com/filippor/cyan-skillfish-gov
 Pick a clock range your cooling can hold; the setup above does not change clocks. `--doctor` warns when no governor
 runs.
 
-### Optional: patched amdgpu (more memory for frame generation)
+### Required: patched amdgpu (all compute units)
 
-Games run on the stock amdgpu with the options above. Superkeka's BC-250 amdgpu patch adds the PS5's second graphics
-ring and interrupt routing; with the stock module, heavy games measured about **400 MiB more GPU memory**, enough to
-keep native frame generation paused in Ghost of Yōtei (Helix upscaling still runs).
+The packages are tested on, and their per-game settings tuned for, Superkeka's BC-250 amdgpu patch. It enables the
+compute units the stock driver leaves off (`amdgpu.bc250_cc_write_mode=3`: **40** active on most boards, 36 or 38 on
+some; stock: 24), maps the game's shared memory the way the PS5 does, and routes the GPU's interrupts to the emulator
+(`amdgpu.bc250_gfx_eop_events=2`). On the stock driver games start, but run on about 60% of the GPU, and heavy games
+need about **400 MiB more GPU memory**, which keeps native frame generation paused in Ghost of Yōtei.
 
 - **CachyOS:** the `linux-cachyos-bc250` kernel from [linux-cachyos-bc250](https://github.com/MastaG/linux-cachyos-bc250)
   includes it.
 - **SteamOS:** build it for your kernel with [`tools/bc250-amdgpu`](tools/bc250-amdgpu/README.md). This replaces the
   GPU driver module; read that README first, keep its rollback, and rebuild after a SteamOS kernel update.
 
-`--prepare-system` adjusts its options automatically when the patched module is loaded.
+`--prepare-system` sets the module's options (including the two above) when the patched module is loaded; reboot
+afterwards and check that `--doctor` reports **Compute units >= 36**.
 
 ## 2. Install KytyPS5
 
@@ -222,7 +226,7 @@ runs takes memory from upscaling and frame generation:
 
 So for the best results play in **PS5 Minimal Mode** (or Steam Game Mode), not in a desktop with other apps open.
 With the stock amdgpu, frame generation can still stay paused in the heaviest scenes; the
-[patched amdgpu](#optional-patched-amdgpu-more-memory-for-frame-generation) gives it the extra room.
+[patched amdgpu](#required-patched-amdgpu-all-compute-units) gives it the extra room.
 
 ## Tested games
 
@@ -234,6 +238,7 @@ version-specific fixes only to the exact versions listed.
 | **Ghost of Yōtei** (Complete Edition) | PPSA26344 | 02.002.000 | HLX FSR 4, Quality, 4K output, FSR 3 frame generation | Plays on SteamOS and CachyOS. Complete Edition add-on licences registered automatically (fixes the endless loading screen); VideoDec2 frame-size fix for its videos; ray tracing mode uses the reserved graphics VMID fix (verified in a bounded test, not long sessions). Cheats available. |
 | **Demon's Souls** (Deluxe Edition) | PPSA01341 | 01.007.000 | Scream assertion recovery on | Tested on CachyOS. Recovery skips the in-game "Scream" assertion that otherwise stops the game; turn it off in the game's settings if you do not need it. The optional HDR-pass skip only applies to 01.004.000 / 01.007.000. Cheats available. |
 | **ASTRO BOT** (EU) | PPSA21567 | 01.018.000 | HLX FSR 4, Performance preset, FSR 3 frame generation | Tested on CachyOS. Its manual upscaling presets are applied only to the exact 01.018.000 EU executable; other regions keep the automatic route. |
+| **Marvel's Wolverine** | PPSA03671 | 01.001.005 | HLX FSR 4, Balanced preset, FSR 3 frame generation | Tested on CachyOS. Runs at its PS5 frame rates (Fidelity 30, Performance ~60) after fixing the emulator's TSC rate and leaving out the game's GPU frame pacer; a shader-scanner fix stops a crash a few minutes into play. HLX and frame generation use a profile tested with this exact executable; every render preset works in both graphics modes (Fidelity upscales to 4K, Performance to 1440p, which the game stretches to 4K). |
 
 **Cheats:** *game → Settings → Cheats* lists the included cheats for Ghost of Yōtei 02.002.000 (infinite health,
 one-hit kill, max resources, uncapped FPS) and Demon's Souls 01.007.000 (infinite health, infinite stamina, 9,999,999
@@ -272,7 +277,8 @@ Start with `--doctor`: every warning names its fix.
 | Black screen or endless loading, Ghost of Yōtei log shows `refused, unknown packet op 0x22` | The amdgpu options are not active. `--prepare-system`, reboot, `--prepare-system --status`. |
 | Large game stops while loading | GTT below 14 GiB: same fix. |
 | `GPU helper socket` FAIL in `--doctor` | `--prepare-system` (it installs the helper), or `systemctl status kyty-lodhw.service`. |
-| Frame generation never turns on | Not enough free RAM. Play in PS5 Minimal Mode, close other apps, use the Quality preset (not Dynamic), or the patched amdgpu. |
+| `Compute units >= 36` or `Patched BC-250 amdgpu` FAIL in `--doctor` | Install the [patched amdgpu](#required-patched-amdgpu-all-compute-units), run `--prepare-system`, reboot. |
+| Frame generation never turns on | Not enough free RAM. Play in PS5 Minimal Mode, close other apps, use the Quality preset (not Dynamic), and check `--doctor` for the patched amdgpu. |
 | HLX upscaling "stopped" | The system ran out of memory; same as above. Select the upscaler again to retry. |
 | Upscaling costs more ms than expected | No GPU governor; the GPU stays near 1500 MHz. |
 | Lossless Scaling does nothing | `Lossless.dll` not found: install Lossless Scaling from Steam or use `--setup-lossless`. |
