@@ -1294,6 +1294,23 @@ void FgEmit(Snapshot& s, uint32_t slot, unsigned& table, bool compute_ring, std:
 			        d.present ? 1 : 0, m.present ? 1 : 0, Plain2D(d.t) ? 1 : 0, Plain2D(m.t) ? 1 : 0, static_cast<unsigned>(d.t.Format()),
 			        static_cast<unsigned>(m.t.Format()), static_cast<unsigned>(d.t.Type()), static_cast<unsigned>(m.t.Type()));
 		}
+		// (diagnostic) What the title bound as motion instead: its layout, and how much of its start is not zero.
+		if (static std::atomic<unsigned> told_motion {0}; m.present && told_motion.fetch_add(1) < 3) {
+			const uint64_t base = m.t.Base40();
+			uint32_t       nonzero = 0, first = 0;
+			const auto*    p       = reinterpret_cast<const volatile uint32_t*>(base);
+			for (uint32_t i = 0; base != 0 && i < 65536; i++) {
+				const uint32_t v = p[i];
+				if (v != 0 && nonzero++ == 0) first = v;
+			}
+			LogJson("{\"event\":\"motion_input\",\"invocation\":%llu,\"base\":\"0x%llx\",\"size\":[%u,%u],\"depth_size\":[%u,%u],"
+			        "\"format\":%u,\"tile\":%u,\"dims\":[%u,%u],\"nonzero_of_65536\":%u,\"first_nonzero\":\"0x%08x\","
+			        "\"fields\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"]}",
+			        static_cast<unsigned long long>(s.id), static_cast<unsigned long long>(base), m.t.Width5() + 1u, m.t.Height5() + 1u,
+			        d.t.Width5() + 1u, d.t.Height5() + 1u, static_cast<unsigned>(m.t.Format()), static_cast<unsigned>((m.t.fields[3] >> 20u) & 31u),
+			        s.dims[kMotion][0], s.dims[kMotion][1], nonzero, first, m.t.fields[0], m.t.fields[1], m.t.fields[2], m.t.fields[3],
+			        m.t.fields[4], m.t.fields[5], m.t.fields[6], m.t.fields[7]);
+		}
 		return;
 	}
 	const uint32_t w = s.dims[kDepth][0], h = s.dims[kDepth][1];
@@ -4463,7 +4480,7 @@ std::array<FgDisplayRecord, 16> g_fg_display {};
 std::array<std::atomic<uint64_t>, 16> g_disp_addr {}, g_disp_size {};
 std::atomic<bool>                     g_disp_any {false};
 struct FgPairing {
-	uint64_t flips = 0, same = 0, earlier = 0, later = 0, no_image = 0, no_tag = 0;
+	uint64_t flips = 0, same = 0, earlier = 0, later = 0, no_image = 0, no_tag = 0, stale = 0;
 } g_fg_pairing; // (g_fg_display_mutex)
 } // namespace
 void FgAddDisplayBuffer(uint64_t addr, uint64_t size) {
@@ -4553,6 +4570,13 @@ uint64_t FgFlipGuides(uint64_t buffer, int index) {
 	}
 	auto& p = g_fg_pairing;
 	p.flips++;
+	// An image far behind the flip's own tag is stale: the title has stopped drawing this buffer in a way the watch
+	// sees (Marvel's Wolverine's gameplay, after its menus), and its guides were recycled long ago. Asking for them
+	// would stop frame generation for good; the tag stands in, as it does when there is no image.
+	if (image != 0 && tag != 0 && image + 8 < tag) {
+		image = 0;
+		p.stale++;
+	}
 	p.no_tag += tag == 0 ? 1 : 0;
 	p.no_image += image == 0 ? 1 : 0;
 	if (image != 0 && tag != 0) {
@@ -4562,11 +4586,11 @@ uint64_t FgFlipGuides(uint64_t buffer, int index) {
 	}
 	if (p.flips <= 6 || p.flips % 600 == 0) {
 		LogJson("{\"event\":\"framegen_pairing\",\"flips\":%llu,\"buffer\":\"0x%llx\",\"index\":%d,\"tag\":%llu,\"image\":%llu,"
-		        "\"same\":%llu,\"image_earlier\":%llu,\"image_later\":%llu,\"no_image\":%llu,\"no_tag\":%llu}",
+		        "\"same\":%llu,\"image_earlier\":%llu,\"image_later\":%llu,\"no_image\":%llu,\"no_tag\":%llu,\"stale\":%llu}",
 		        static_cast<unsigned long long>(p.flips), static_cast<unsigned long long>(buffer), index,
 		        static_cast<unsigned long long>(tag), static_cast<unsigned long long>(image), static_cast<unsigned long long>(p.same),
 		        static_cast<unsigned long long>(p.earlier), static_cast<unsigned long long>(p.later),
-		        static_cast<unsigned long long>(p.no_image), static_cast<unsigned long long>(p.no_tag));
+		        static_cast<unsigned long long>(p.no_image), static_cast<unsigned long long>(p.no_tag), static_cast<unsigned long long>(p.stale));
 	}
 	return image != 0 ? image : tag;
 }
