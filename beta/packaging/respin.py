@@ -45,8 +45,12 @@ CHANGES = [
     "(KYTY_NATIVE_GPU_SPIN_PACER=keep keeps it)",
     "Fewer stutters in games that stream memory constantly (Marvel's Wolverine: frames of 80 ms or more went from "
     "about 165 to 1 per three minutes): unmapping automatic memory no longer walks every mapping",
-    "The native and upscaler backends are rebuilt from the same source as Beta 6 plus these fixes; the other backends "
-    "are Beta 6's",
+    "Marvel's Wolverine no longer crashes a few minutes into play: the shader scanner read the data after a split "
+    "shader's final jump as code, refused 834 of the game's shaders and the game rendered with a missing target",
+    "Superkeka's KytyPS5-Native main of 2026-11-17 (f820b8e9) merged: video-out buffers keep their DCC behind a plain "
+    "copy for the presenter and DCC metadata is reset after a title's DCC clear (Gran Turismo 7's black replays), game "
+    "patches move console addresses in their code",
+    "The native and upscaler backends are rebuilt from that source; the other backends are Beta 6's",
 ]
 
 
