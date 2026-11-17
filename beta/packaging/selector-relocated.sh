@@ -265,13 +265,22 @@ PY
 )" || tested=
     if [[ -n "$tested" ]]; then
         tested_copy="$(dirname -- "$up_profile")/$(basename -- "$tested" .json).tested.json"
+        # The tested calibration (jitter, motion vectors) as the first cache: the first launch starts calibrated.
+        tested_cal="${tested%.json}.calibration.json"
+        if [[ -f "$tested_cal" && ! -f "${tested_copy%.json}.calibration.json" ]]; then
+            cp -f -- "$tested_cal" "${tested_copy%.json}.calibration.json" 2>/dev/null || true
+        fi
         if cp -f -- "$tested" "$tested_copy" 2>/dev/null; then
             up_profile="$tested_copy" up_state=available up_fg_state=available up_adapter=taa_static_v1
             # Render presets (make-wolverine-presets.py): a fixed size for every step of the game's dynamic resolution,
             # upscaled to 4K (Ultra Quality 2816x1584, Quality 2560x1440, Balanced 2304x1296, Performance 1920x1080,
             # Ultra Performance 1664x936). Dynamic keeps the game's own resolution range.
             case "$up_preset" in
-                ultra_quality|quality|balanced|performance|ultra_performance) wolverine_preset="${up_preset//_/-}" ;;
+                # At 2560x1440 the game switches to another upscaler pass when play starts, which the profile does not
+                # cover yet (HLX and frame generation would stop): Quality runs as Balanced for now.
+                quality) wolverine_preset=balanced
+                         echo "[Kyty launcher] Marvel's Wolverine: the Quality preset runs as Balanced (2304x1296) for now." >&2 ;;
+                ultra_quality|balanced|performance|ultra_performance) wolverine_preset="${up_preset//_/-}" ;;
                 *) wolverine_preset=none ;;
             esac
             wolverine_drs="$title_profiles/$(basename -- "$tested" | cut -d- -f1-2)-$wolverine_preset.json"

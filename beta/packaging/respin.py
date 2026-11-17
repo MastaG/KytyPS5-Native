@@ -39,6 +39,8 @@ OVERLAY = {
        for f in sorted((Path(__file__).resolve().parents[1] / 'astro-templates').glob('*.json'))},
     **{'beta/title-profiles/' + f.name: 'upscalers/title-profiles/' + f.name
        for f in sorted((Path(__file__).resolve().parents[1] / 'title-profiles').glob('*.json'))},
+    **{'beta/title-defaults/' + f.name: 'title-defaults/' + f.name
+       for f in sorted((Path(__file__).resolve().parents[1] / 'title-defaults').glob('*.json'))},
 }
 CHANGES = [
     "Marvel's Wolverine runs at its target frame rate: Fidelity a locked 30 fps (was 15) and Performance about 50-58 "
@@ -52,10 +54,16 @@ CHANGES = [
     "Superkeka's KytyPS5-Native main of 2026-11-17 (f820b8e9) merged: video-out buffers keep their DCC behind a plain "
     "copy for the presenter and DCC metadata is reset after a title's DCC clear (Gran Turismo 7's black replays), game "
     "patches move console addresses in their code",
-    "Marvel's Wolverine with HLX and frame generation: the package carries the tested upscaler profile for the game's "
-    "01.001.005 executable (the scan does not find its upscaler pass), and with HLX the Fidelity mode's dynamic "
-    "resolution may go down to 1664x936 so HLX fits in its frame instead of costing frames. The HLX helper takes the "
-    "game's 11:11:10 float colour and 16-bit float depth",
+    "Marvel's Wolverine with HLX and frame generation: the package carries the tested upscaler profile and calibration "
+    "for the game's 01.001.005 executable (the scan does not find its upscaler pass) and fixed 4K render presets "
+    "(Ultra Quality 2816x1584, Balanced 2304x1296, Performance 1920x1080); the HLX helper takes the game's 11:11:10 "
+    "float colour and 16-bit float depth",
+    "Marvel's Wolverine starts with HLX FSR 4, the Balanced preset (2304x1296 upscaled to 4K) and FSR 3 frame "
+    "generation; its Quality preset runs as Balanced for now (at 2560x1440 the game switches to an upscaler pass the "
+    "profile does not cover yet)",
+    "Frame generation keeps running when a game stops drawing its video-out buffers in a way the emulator watches "
+    "(Wolverine's gameplay), and linear view depth is converted for HLX and frame generation (no ghosting around "
+    "moving characters)",
     "The native and upscaler backends are rebuilt from that source; the other backends are Beta 6's",
 ]
 
