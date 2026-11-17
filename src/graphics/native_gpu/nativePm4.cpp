@@ -2432,7 +2432,20 @@ void Pm4Translator::SeedPs5Defaults() {
 	}
 }
 
+void Pm4Translator::SelectComputeQueue(uint32_t queue) {
+	if (m_active_compute_queue == queue) {
+		return;
+	}
+	if (m_active_compute_queue.has_value()) {
+		m_compute_shadows[*m_active_compute_queue] = std::move(m_sh);
+		m_sh = std::move(m_compute_shadows[queue]);
+	}
+	m_active_compute_queue = queue;
+}
+
 void Pm4Translator::ResetShadow() {
+	m_compute_shadows.clear();
+	m_active_compute_queue.reset();
 	m_cx.clear();
 	m_sh.clear();
 	m_uc.clear();
@@ -7083,11 +7096,12 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 	if (cp_shadow && head_from_start) {
 		EmitShadowPreamble(cp_head, head_stats, m_cx, m_sh, m_uc, m_cp);
 	}
-	std::optional<RegFile> start_cx, start_sh, start_uc; // only when they are used (12 KiB to clear otherwise)
-	if (m_preamble_from_start && !cp_shadow) {
-		start_cx = m_cx;
-		start_sh = m_sh;
-		start_uc = m_uc;
+	// MEC buffers may dispatch with inherited registers before programming the next shader.
+	// Build their replay from the queue state at entry, before committing the final writes.
+	const bool replay_start = !cp_shadow && (m_compute_ring || m_preamble_from_start);
+	std::vector<uint32_t> start_preamble;
+	if (replay_start && (!labels || (seg_keep.front() && !m_no_preamble))) {
+		EmitPreamble(start_preamble, stats, m_cx, m_sh, m_uc, m_cp);
 	}
 	m_cx        = std::move(cx);
 	m_saved_cx  = std::move(saved_cx);
@@ -7194,8 +7208,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 				} else if (cp_shadow) {
 					r.ib.insert(r.ib.end(), cp_head.begin(), cp_head.end());
 					s.cp_shadow_head = true;
-				} else if (m_preamble_from_start) {
-					EmitPreamble(r.ib, stats, *start_cx, *start_sh, *start_uc, cp_start);
+				} else if (replay_start) {
+					r.ib.insert(r.ib.end(), start_preamble.begin(), start_preamble.end());
 				} else {
 					EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
 				}
@@ -7261,6 +7275,8 @@ Pm4TranslateResult Pm4Translator::Translate(std::span<const uint32_t> dcb) {
 		r.ib.reserve(body.size() + (m_cx.size() + m_sh.size() + m_uc.size()) * 3 + 8);
 		if (cp_shadow) {
 			r.ib.insert(r.ib.end(), cp_head.begin(), cp_head.end());
+		} else if (replay_start) {
+			r.ib.insert(r.ib.end(), start_preamble.begin(), start_preamble.end());
 		} else {
 			EmitPreamble(r.ib, stats, m_cx, m_sh, m_uc, cp_start);
 		}

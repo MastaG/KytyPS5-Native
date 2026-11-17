@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_set>
 #include <memory>
@@ -1115,6 +1116,8 @@ public:
 	// ring: the guest DISPATCH_INDIRECT is kept, and RELEASE_MEM / WAIT_REG_MEM carry the compute
 	// shader bit. Graphics-only packets are refused.
 	void SetComputeRing(bool compute_ring) { m_compute_ring = compute_ring; }
+	// Shader registers persist across buffers on the same guest compute queue.
+	void SelectComputeQueue(uint32_t queue);
 
 	// Direct execution (KYTY_NATIVE_GPU_DIRECT_RUNS): a stretch of at least `min_dw` dwords the
 	// translator passes on as written runs from the guest's buffer as an IB2 (INDIRECT_BUFFER) instead
@@ -1383,6 +1386,8 @@ private:
 	RegFile                      m_saved_cx;    // context pushed by an Agc context-state push
 	bool                         m_cx_pushed = false;
 	RegFile                      m_sh; // SH registers (SET_SH_REG space)
+	std::optional<uint32_t>       m_active_compute_queue;
+	std::map<uint32_t, RegFile>   m_compute_shadows;
 	RegFile                      m_uc; // whitelisted UCONFIG registers
 	Pm4CpDrawState               m_cp; // CP draw state where the next DCB starts
 	bool                         m_gds = false;

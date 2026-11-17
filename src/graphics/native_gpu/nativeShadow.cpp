@@ -3306,11 +3306,12 @@ public:
 	// fence, the slot's last dword. Compute rings run at once, and a barrier releases its own value into
 	// the fence and waits for exactly that value: a fence shared with another ring can be overwritten in
 	// between, and the wait never ends. Called on the label-pipeline thread before that queue is translated.
-	void UseAcbTracker(uint32_t slot) {
+	void UseAcbTracker(uint32_t slot, uint32_t guest_queue) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_label_oracle == nullptr || m_submitter == nullptr || slot >= kTrackerSlots) {
 			return;
 		}
+		m_acb_translator.SelectComputeQueue(guest_queue);
 		const uint64_t va = m_submitter->ScratchVa() + kTrackerOffset + static_cast<uint64_t>(slot) * kTrackerStride;
 		m_acb_translator.SetNativeLabels(AcbThreadOn() ? m_acb_oracle : m_label_oracle, va);
 		m_acb_translator.SetFenceAddress(va + 12);
@@ -3323,6 +3324,7 @@ public:
 		m_acb_translator.SetGuestInterruptsCtx0(own && m_irq_ctx0);
 #else
 		(void)slot;
+		(void)guest_queue;
 #endif
 	}
 
@@ -7699,7 +7701,7 @@ private:
 		Pm4TranslateResult r;
 		m_translating = job.queue;
 		if (m_acb_rings && compute && !m_acb_thread) {
-			Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
+			Shadow::Instance().UseAcbTracker(SlotOf(job.queue), job.queue);
 		} else if (job.queue == kGuestAgrQueue) {
 			Shadow::Instance().UseAgrTracker(SlotOf(job.queue)); // before its waits are planned
 		}
@@ -7843,7 +7845,7 @@ private:
 		ready.queue   = job.queue;
 		ready.done    = std::move(done);
 		ready.made    = m_emits.load(std::memory_order_relaxed);
-		Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
+		Shadow::Instance().UseAcbTracker(SlotOf(job.queue), job.queue);
 		ready.translated = Shadow::Instance().TranslateAcb(std::span<const uint32_t>(job.buffer, job.size_dw), &ready.t);
 		return ready;
 	}
