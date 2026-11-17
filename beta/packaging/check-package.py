@@ -24,6 +24,15 @@ for f in (bundle / 'patches').glob('*.json'):
 for f in [bundle/'AppRun', bundle/'runtime-selector.sh', bundle/'selector-relocated.sh']:
     check('/home/david' not in f.read_text(), 'No developer path in ' + f.name)
     subprocess.run(['bash','-n',str(f)],check=True)
+# Every text file this project ships (not the bundled third-party trees): no home folder of the machine that built it.
+own_text = [f for f in bundle.rglob('*') if f.is_file() and not f.is_symlink() and f.suffix in ('.json', '.sh', '.py', '.md', '.txt', '.desktop', '.ini')
+            and not any(p in ('python', 'proton', 'dotnet', 'runtime', 'licenses', 'launcher', 'framegen', 'system') for p in f.relative_to(bundle).parts[:1])]
+leaks = [str(f.relative_to(bundle)) for f in own_text if '/home/' in f.read_text(errors='replace')]
+check(not leaks, 'No home-folder path in the package\'s own text files (' + str(len(own_text)) + ' files)' + (': ' + ', '.join(leaks[:5]) if leaks else ''))
+# The upscaler backends carry the developer's HLX folder and Proton only as fallbacks: the selector must always set both.
+selector_text = (bundle / 'selector-relocated.sh').read_text()
+check('export KYTY_HLX_HOME="$beta_data/upscalers" KYTY_HLX_PROTON="$bundle_root/proton/files"' in selector_text,
+      'The selector gives the emulator the package\'s HLX folder and Proton')
 with tempfile.TemporaryDirectory(prefix='kyty-beta-package-') as temp:
     temp = Path(temp)
     env = os.environ.copy()

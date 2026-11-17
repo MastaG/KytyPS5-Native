@@ -12,8 +12,7 @@
   "sha256": "3f15c99ec93aaf827b2d0338ee730400be12ebc7c20ebfe76773597d015f5497",
   "executable_bytes": "0xb7798fa",
   "location": {
-   "archive": "/home/david/Downloads/PPSA03671/PPSA03671.zar",
-   "member": "PPSA03671-app/eboot.bin"
+   "member": "eboot.bin"
   },
   "stamp": "111528614602|1794524532401573393",
   "attribute3": "0x8441044",
