@@ -32,6 +32,7 @@
 #include <condition_variable>
 #include <array>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <ctime>
 #include <map>
@@ -4237,6 +4238,8 @@ public:
 			return;
 		}
 		dir += "/KytyPS5-Native/data";
+		std::error_code made; // a fresh system has no such folder yet
+		std::filesystem::create_directories(dir, made);
 		const std::string path = dir + "/gpu-fault.txt";
 		if (std::FILE* f = std::fopen(path.c_str(), "w"); f != nullptr) {
 			const std::time_t now = std::time(nullptr);

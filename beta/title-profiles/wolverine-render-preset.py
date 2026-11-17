@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Marvel's Wolverine (PPSA03671 01.001.005): a render preset's plan, as a game-patch JSON.
 
-usage: wolverine-render-preset.py PRESET OUT_FILE
+usage: wolverine-render-preset.py PRESET OUT_FILE [--framegen]
        PRESET: dlaa | ultra_quality | quality | balanced | performance | ultra_performance
+       --framegen: frame generation is on (Fidelity then renders at most FRAMEGEN_FIDELITY_MAX, see below)
 
 The game's dynamic resolution picks render sizes from a table in its executable (0x9b7e7d0: 11 steps of
 {width, height, cost in three mode columns}, 3840x2160 down to 1664x936; a 0 cost leaves a step out of that column).
@@ -29,6 +30,13 @@ RATIOS = {'dlaa': None, 'ultra_quality': 1.3, 'quality': 1.5, 'balanced': 1.7, '
 FIDELITY_TARGET, PERFORMANCE_TARGET = (3840, 2160), (2560, 1440)
 
 
+# Fidelity runs at 30 fps with almost no time to spare. Measured 2026-11-17 in the new game's first area (5-minute runs,
+# HLX FSR 4 to 4K): Quality (2560x1440) holds 30 with HLX alone but falls to 20 with frame generation, whatever frame
+# generation's working size (4K, 1440p or 1080p alike) or the GPU job streaming; Balanced (2176x1224) holds 30 + 30. With
+# frame generation on, Fidelity therefore renders at most this size (Performance, 60 fps by itself, is not affected).
+FRAMEGEN_FIDELITY_MAX = (2176, 1224)
+
+
 # The game sizes its render targets for at most its base-PS5 maximum step (3328x1872; 3840x2160 is the PS5 Pro's):
 # a larger size fails an allocation check at start (an ud2 at eboot 0x382e8fd, seen with 3776x2124 and 3712x2088).
 MAX_WIDTH = 3328
@@ -42,9 +50,11 @@ def size_for(target_w, target_h, ratio):
     return w, w * target_h // target_w
 
 
-def plan(preset):
+def plan(preset, framegen=False):
     ratio = RATIOS[preset]
     fid = size_for(*FIDELITY_TARGET, ratio)
+    if framegen and fid[0] > FRAMEGEN_FIDELITY_MAX[0]:
+        fid = FRAMEGEN_FIDELITY_MAX
     perf = size_for(*PERFORMANCE_TARGET, ratio)
     row = lambda w, h, c: struct.pack('<IIfff', w, h, *c).hex()
     mem = []
@@ -55,15 +65,18 @@ def plan(preset):
         else:
             new = (perf[0], perf[1], (0.0, 0.0, c or b))
         mem.append({'offset': f'{TABLE + i * 20:x}', 'off': row(w, h, (a, b, c)), 'on': row(new[0], new[1], new[2])})
-    name = f'{preset}: Fidelity {fid[0]}x{fid[1]} -> 3840x2160, Performance {perf[0]}x{perf[1]} -> 2560x1440'
+    name = (f'{preset}{" (frame generation)" if framegen else ""}: Fidelity {fid[0]}x{fid[1]} -> 3840x2160, '
+            f'Performance {perf[0]}x{perf[1]} -> 2560x1440')
     return {'id': 'PPSA03671', 'version': '01.001.005', 'process': 'eboot.bin',
             'mods': [{'name': name, 'enabled': True, 'memory': mem}]}, fid, perf
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3 or sys.argv[1] not in RATIOS:
+    args = [a for a in sys.argv[1:] if a != '--framegen']
+    if len(args) != 2 or args[0] not in RATIOS:
         raise SystemExit(__doc__)
-    p, fid, perf = plan(sys.argv[1])
+    sys.argv[1:3] = args
+    p, fid, perf = plan(args[0], '--framegen' in sys.argv[1:])
     with open(sys.argv[2], 'w', encoding='utf-8') as f:
         json.dump(p, f, indent=1)
     print(f'{fid[0]}x{fid[1]} {perf[0]}x{perf[1]}')
