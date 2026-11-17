@@ -3814,6 +3814,14 @@ void TaaCapture(uint64_t packet, uint64_t shader, const uint32_t* ud, uint32_t u
 	if (CompositeRouteWanted() && rw == s.res[kOutput].t.Width5() + 1u && rh == s.res[kOutput].t.Height5() + 1u) {
 		g_composite_taa = std::make_shared<Snapshot>(s);
 	}
+	// KYTY_NATIVE_UPSCALER_LOG_RENDER=1 (diagnostic): every TAA invocation's render size with CLOCK_MONOTONIC ms (the
+	// flip trace's clock), to see how the title's dynamic resolution follows the frame time.
+	if (static const bool log_render = std::getenv("KYTY_NATIVE_UPSCALER_LOG_RENDER") != nullptr; log_render) {
+		struct timespec now {};
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		LogJson("{\"event\":\"rs\",\"id\":%llu,\"t\":%.2f,\"w\":%u,\"h\":%u}", static_cast<unsigned long long>(s.id),
+		        static_cast<double>(now.tv_sec) * 1e3 + static_cast<double>(now.tv_nsec) / 1e6, rw, rh);
+	}
 	if (s.id <= 3 || s.id % 600 == 0) {
 		LogJson("{\"event\":\"taa_capture\",\"ring\":\"%s\",\"invocation\":%llu,\"render\":[%u,%u],\"output\":[%u,%u],\"color_capacity\":[%u,%u],\"output_capacity\":[%u,%u],\"jitter_px\":[%.4f,%.4f],\"scale\":%.5g,"
 		        "\"color\":\"0x%llx\",\"depth\":\"0x%llx\",\"motion\":\"0x%llx\",\"output_va\":\"0x%llx\",\"busy\":%llu}",
