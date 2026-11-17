@@ -32,9 +32,10 @@ FIDELITY_TARGET, PERFORMANCE_TARGET = (3840, 2160), (2560, 1440)
 
 # Fidelity runs at 30 fps with almost no time to spare. Measured 2026-11-17 in the new game's first area (5-minute runs,
 # HLX FSR 4 to 4K): Quality (2560x1440) holds 30 with HLX alone but falls to 20 with frame generation, whatever frame
-# generation's working size (4K, 1440p or 1080p alike) or the GPU job streaming; Balanced (2176x1224) holds 30 + 30. With
-# frame generation on, Fidelity therefore renders at most this size (Performance, 60 fps by itself, is not affected).
-FRAMEGEN_FIDELITY_MAX = (2176, 1224)
+# generation's working size (4K, 1440p or 1080p alike) or the GPU job streaming; 2176x1224 averaged 25-28 real fps
+# (30 in 20-69 % of 5-second windows), 1920x1080 29 (70 %, none under 23). With frame generation on, Fidelity therefore
+# renders at most 1920x1080 (Performance, 60 fps by itself, is not affected).
+FRAMEGEN_FIDELITY_MAX = (1920, 1080)
 
 
 # The game sizes its render targets for at most its base-PS5 maximum step (3328x1872; 3840x2160 is the PS5 Pro's):

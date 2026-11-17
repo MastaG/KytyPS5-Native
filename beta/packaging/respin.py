@@ -44,10 +44,11 @@ OVERLAY = {
 }
 CHANGES = [
     "Marvel's Wolverine with frame generation keeps Fidelity at 30 fps: with frame generation on (native or Lossless), "
-    "Fidelity renders at most 2176x1224 whatever the preset. A fresh install's new game ran Quality + HLX + frame "
+    "Fidelity renders at most 1920x1080 whatever the preset. A fresh install's new game ran Quality + HLX + frame "
     "generation at 20 fps: measured in that area, Quality holds 30 with HLX alone but falls to 20 once frame generation "
-    "is on (at any frame-generation working size), while 2176x1224 holds 30 + 30. Without frame generation every "
-    "preset renders its own size; Performance mode is unchanged",
+    "is on (at any frame-generation working size), 2176x1224 averages 25-28 and 1920x1080 29 (30 + 30 most of the "
+    "time). Without frame generation every preset renders its own size (Quality: a steady 30 with HLX); Performance "
+    "mode is unchanged",
     "The GPU fault report (gpu-fault.txt) is written on a fresh system too (its folder is created)",
     "The native and upscaler backends are rebuilt from that source; everything else is Beta 7's",
 ]

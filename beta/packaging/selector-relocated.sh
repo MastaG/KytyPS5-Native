@@ -279,8 +279,8 @@ PY
             # ratio (Fidelity and the menus upscale to 3840x2160, Performance to 2560x1440, whatever the window size;
             # the output choice only scales the window), always below the target (Native AA one step below).
             # Dynamic keeps the game's own resolution range.
-            # With frame generation on, Fidelity renders at most 2176x1224: larger sizes leave its 30 fps no room for
-            # frame generation and fall to 20 (measured; see the script).
+            # With frame generation on, Fidelity renders at most 1920x1080: larger sizes leave its 30 fps no room for
+            # frame generation and fall to 20-28 (measured; see the script).
             wolverine_drs= wolverine_fg= wolverine_fg_note=
             case "$up_fg" in fsr3|fsr3_dynamic|auto) wolverine_fg=--framegen ;; esac
             [[ "$fg_mode" != off ]] && wolverine_fg=--framegen
@@ -291,7 +291,7 @@ PY
                         echo "[Kyty launcher] Marvel's Wolverine: the $up_preset render preset could not be prepared; the game keeps its own resolution." >&2
                         wolverine_drs=
                     else
-                        [[ -n "$wolverine_fg" ]] && wolverine_fg_note=" (frame generation on: Fidelity at most 2176x1224, so it keeps 30 fps)"
+                        [[ -n "$wolverine_fg" ]] && wolverine_fg_note=" (frame generation on: Fidelity at most 1920x1080, so it keeps 30 fps)"
                         echo "[Kyty launcher] Marvel's Wolverine: $up_preset renders Fidelity at ${wolverine_sizes% *} (to 3840x2160) and Performance at ${wolverine_sizes#* } (to 2560x1440)$wolverine_fg_note." >&2
                     fi ;;
             esac
