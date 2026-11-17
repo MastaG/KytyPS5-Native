@@ -12,7 +12,8 @@ scripts and tools of this source tree laid over them.
 
 The work directory is $KYTY_BETA_BASE (work/, dist/, validation/). Used for Beta 5 (2026.11.13: launch scripts and
 upscaler scanner only) and Beta 6 (2026.11.15: the native and upscaler backends rebuilt from Superkeka's 2026-11-13
-main, CMake build with KYTY_NATIVE_UPSCALER and KYTY_COMPAT_LIBM_DIR); `build.py` builds a package from scratch.
+main, CMake build with KYTY_NATIVE_UPSCALER and KYTY_COMPAT_LIBM_DIR) and Beta 7 (2026.11.17: Wolverine fixes in
+those two backends); `build.py` builds a package from scratch.
 """
 import hashlib, json, os, shutil, subprocess, sys, tarfile
 from pathlib import Path
@@ -38,22 +39,14 @@ OVERLAY = {
        for f in sorted((Path(__file__).resolve().parents[1] / 'astro-templates').glob('*.json'))},
 }
 CHANGES = [
-    "Emulator rebuilt from Superkeka's KytyPS5-Native main of 2026-11-13 (e204925f, 299 commits newer than Beta 5's "
-    "base) with this fork's BC-250 work merged in: upscaler and frame generation (HLX FSR 4, FSR 3), Demon's Souls TAA "
-    "frame generation and Scream recovery; Superkeka's gfx VMID reservation replaces this fork's",
-    "The native and upscaler backends come from one CMake build (KYTY_NATIVE_UPSCALER), linked against SteamOS 3.8's "
-    "libm so they need glibc 2.38 like the rest of the package; the Astro, Demon's Souls guard/audio and Fast backends "
-    "are Beta 5's",
-    "--shader-optimization-type, which the new emulator no longer has, is left out for the new backends instead of "
-    "stopping the launch",
-    "ASTRO BOT honours every render preset: Quality 2560x1440, Balanced 2304x1296, Performance 1920x1080 and Ultra "
-    "Performance 1280x720 join Ultra Quality and Native (before, they silently became the game's own dynamic resolution, "
-    "also for the title's default Performance)",
-    "AppRun keeps KYTYPS5_SESSION_CONTROL when the session provides one (own PS5 sessions keep their Return to "
-    "Desktop Mode control)",
-    "The patched BC-250 amdgpu is required: --doctor checks for 36 or more active compute units (40 on most boards, "
-    "24 on the stock driver) and the module's options; --prepare-system also sets bc250_cc_write_mode=3 and "
-    "bc250_gfx_eop_events=2",
+    "Marvel's Wolverine runs at its target frame rate: Fidelity a locked 30 fps (was 15) and Performance about 50-58 "
+    "(was 30-40). The emulator's TSC rate is now measured against the GPU clock (the wall-clock calibration ran 0.19 % "
+    "fast, so every GPU deadline a game computes from the TSC drifted), and the game's GPU spin pacer is left out "
+    "(KYTY_NATIVE_GPU_SPIN_PACER=keep keeps it)",
+    "Fewer stutters in games that stream memory constantly (Marvel's Wolverine: frames of 80 ms or more went from "
+    "about 165 to 1 per three minutes): unmapping automatic memory no longer walks every mapping",
+    "The native and upscaler backends are rebuilt from the same source as Beta 6 plus these fixes; the other backends "
+    "are Beta 6's",
 ]
 
 
