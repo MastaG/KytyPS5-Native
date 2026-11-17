@@ -60,6 +60,16 @@ bool PrepareNativeShader(Shader* shader, uint32_t* patched_size) {
 	auto refuse = [&](const char* why) {
 		std::fprintf(stderr, "native shader: instruction patch refused for %p: %s\n",
 		             const_cast<const void*>(shader->code), why);
+		// KYTY_NATIVE_GPU_DUMP_REFUSED=DIR (diagnostic): the refused shader's code as DIR/<address>-<type>.bin.
+		if (static const char* dir = std::getenv("KYTY_NATIVE_GPU_DUMP_REFUSED"); dir != nullptr && dir[0] != '\0') {
+			char path[512];
+			std::snprintf(path, sizeof(path), "%s/%llx-%u.bin", dir,
+			              static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(shader->code)), static_cast<unsigned>(shader->type));
+			if (std::FILE* f = std::fopen(path, "wb"); f != nullptr) {
+				std::fwrite(original.data(), 4, original.size(), f);
+				std::fclose(f);
+			}
+		}
 		return false;
 	};
 	if (scan.decode_error || scan.truncated || scan.Count(ScanKind::PcRelOutside) ||
