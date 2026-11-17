@@ -274,6 +274,23 @@ PY
             up_profile="$tested_copy" up_state=available up_fg_state=available up_adapter=taa_static_v1
             # HLX upscales to the game's own target (4K / 1440p, see below); a smaller HLX output would only be scaled
             # back up into it. The output choice still sets the window (the presenter scales to the display).
+            if [[ -n "$up_output" ]]; then
+                # The launcher requests a 4K window for intermediate HLX output sizes. This title
+                # uses its own internal output size, so apply the chosen size to its window here.
+                case "$up_output" in
+                    1440) window_width=2560 ;;
+                    1800) window_width=3200 ;;
+                esac
+                window_args=()
+                while (($#)); do
+                    case "$1" in
+                        --screen-width|--screen-height) shift; (($#)) && shift ;;
+                        --screen-width=*|--screen-height=*) shift ;;
+                        *) window_args+=("$1"); shift ;;
+                    esac
+                done
+                set -- "${window_args[@]}" --screen-width "$window_width" --screen-height "$up_output"
+            fi
             up_output=
             # Render presets (wolverine-render-preset.py): each graphics mode renders at its own target / the preset's
             # ratio (Fidelity and the menus upscale to 3840x2160, Performance to 2560x1440, whatever the window size;

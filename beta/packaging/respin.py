@@ -43,12 +43,16 @@ OVERLAY = {
        for f in sorted((Path(__file__).resolve().parents[1] / 'title-defaults').glob('*.json'))},
 }
 CHANGES = [
+    "Marvel's Wolverine: both main emulator backends restore the active shader for each guest compute queue "
+    "at the start of its next command buffer. The player passed the opening-area crash with HLX FSR 4 and "
+    "native FSR 3 frame generation enabled",
     "Marvel's Wolverine with frame generation keeps Fidelity at 30 fps: with frame generation on (native or Lossless), "
     "Fidelity renders at most 1920x1080 whatever the preset. A fresh install's new game ran Quality + HLX + frame "
     "generation at 20 fps: measured in that area, Quality holds 30 with HLX alone but falls to 20 once frame generation "
     "is on (at any frame-generation working size), 2176x1224 averages 25-28 and 1920x1080 29 (30 + 30 most of the "
     "time). Without frame generation every preset renders its own size (Quality: a steady 30 with HLX); Performance "
     "mode is unchanged",
+    "Marvel's Wolverine: the 1440p and 1800p output choices set the presentation window while the game keeps its own internal output size",
     "The GPU fault report (gpu-fault.txt) is written on a fresh system too (its folder is created)",
     "The native and upscaler backends are rebuilt from that source; everything else is Beta 7's",
 ]

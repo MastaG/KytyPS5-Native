@@ -56,6 +56,14 @@ with tempfile.TemporaryDirectory(prefix='kyty-beta-package-') as temp:
         route(extra, adapter, binary, ['KYTY_FRAMEGEN=fsr3'])
     route(dict(extra,KYTY_BC250_TITLE_ID='PPSA01341',KYTY_DEMONS_SCREAM_ASSERT_RECOVERY='1'), 'Recovery after TAA selection', 'kyty_emulator_launcher_taa_fg', ['KYTY_DEMONS_SCREAM_ASSERT_RECOVERY=1'])
     route(dict(extra,KYTY_BC250_TITLE_ID='PPSA01341',KYTY_DEMONS_SCREAM_ASSERT_RECOVERY='0'), 'Recovery Off', 'kyty_emulator_launcher_taa_fg', absent=['KYTY_DEMONS_SCREAM_ASSERT_RECOVERY=1'])
+    tested = next(p for p in (bundle/'upscalers/title-profiles').glob('PPSA03671-*.json') if not p.name.endswith('.calibration.json'))
+    profile.write_bytes(tested.read_bytes())
+    for width, height in [('2560', '1440'), ('3200', '1800')]:
+        route(dict(extra, KYTY_BC250_TITLE_ID='PPSA03671', KYTY_UPSCALE_OUTPUT=height),
+              f'Wolverine {height}p display', 'kyty_emulator_auto_upscaler',
+              [f'Argument: --screen-width\nArgument: {width}', f'Argument: --screen-height\nArgument: {height}'],
+              ['KYTY_UPSCALE_OUTPUT=', 'Argument: 3840', 'Argument: 2160'],
+              args=['--game', str(temp/'eboot.bin'), '--screen-width', '3840', '--screen-height', '2160'])
     # Read-only validation against the developer's current real archive; never execute the game.
     original = Path('/home/david/astro-helix-framegen-20261110/manual/astro-manual.json')
     g = json.loads(original.read_text())['game']['location']

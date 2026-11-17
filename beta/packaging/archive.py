@@ -21,7 +21,8 @@ elif kind == 'zip':
                 info=zipfile.ZipInfo(arc)
                 info.create_system=3; info.external_attr=(stat.S_IFLNK|0o777)<<16
                 z.writestr(info,os.readlink(p).encode())
-            elif p.is_file(): z.write(p,arc)
+            elif p.is_file() or p.is_dir():
+                z.write(p, arc)  # Include empty runtime directories in the portable ZIP.
 elif kind == 'source':
     def keep(info):
         if any(part in ('artifacts','bin','obj','__pycache__','.git','.packages') for part in Path(info.name).parts): return None
