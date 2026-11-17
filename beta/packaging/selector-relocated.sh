@@ -246,8 +246,9 @@ fi
 # Marvel's Wolverine: the static scan does not find its temporal upscaler (the resolve was found at run time), so the
 # package carries the tested profile (upscalers/title-profiles) for the executable it was made with. It is used only
 # when this copy's executable is that one (same SHA-256 as the scan's); a copy into the profile folder keeps the
-# calibration the emulator caches next to it. With HLX, the Fidelity mode's dynamic resolution may go down to 1664x936
-# (the Performance mode's floor): HLX then fits in Fidelity's 33 ms frame instead of costing frames.
+# calibration the emulator caches next to it. With HLX and the Dynamic preset, the Fidelity mode's dynamic resolution
+# may go down to 1664x936 (the Performance mode's floor): HLX then fits in Fidelity's 33 ms frame instead of costing
+# frames. The other presets fix the render size.
 title_profiles="$bundle_root/upscalers/title-profiles"
 if [[ "$astro_manual" == "0" && "$up_build" == "1" && "$mode" == upstream && "$content_title" == PPSA03671 &&
       -n "$up_profile" && -f "$up_profile" ]]; then
@@ -268,7 +269,14 @@ PY
         tested_copy="$(dirname -- "$up_profile")/$(basename -- "$tested" .json).tested.json"
         if cp -f -- "$tested" "$tested_copy" 2>/dev/null; then
             up_profile="$tested_copy" up_state=available up_fg_state=available up_adapter=taa_static_v1
-            wolverine_drs="$title_profiles/$(basename -- "$tested" | cut -d- -f1-2)-fidelity-drs.json"
+            # Render presets (make-wolverine-presets.py): a fixed size for every step of the game's dynamic resolution
+            # (Ultra Quality 2816x1584, Quality 2560x1440, Balanced 2304x1296, Performance 1920x1080, Ultra Performance
+            # 1664x936), or Dynamic: the game's own resolution with Fidelity allowed down to 1664x936.
+            case "$up_preset" in
+                ultra_quality|quality|balanced|performance|ultra_performance) wolverine_preset="${up_preset//_/-}" ;;
+                *) wolverine_preset=fidelity-drs ;;
+            esac
+            wolverine_drs="$title_profiles/$(basename -- "$tested" | cut -d- -f1-2)-$wolverine_preset.json"
             if [[ "$up_kind" != game && -f "$wolverine_drs" ]]; then export KYTY_RENDER_PRESET_PATCH="$wolverine_drs"; fi
             echo "[Kyty launcher] Marvel's Wolverine: the package's tested upscaler profile ($(basename -- "$tested"))." >&2
         fi
