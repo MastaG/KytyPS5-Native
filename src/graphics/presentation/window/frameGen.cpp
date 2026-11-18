@@ -71,6 +71,10 @@ bool Supported(vk::Format f) {
 	return f == vk::Format::eA2B10G10R10UnormPack32 || f == vk::Format::eR8G8B8A8Unorm || f == vk::Format::eB8G8R8A8Unorm;
 }
 
+// PQ frames: FSR works on linear light scaled to this peak (it converts PQ to linear, interpolates and back with
+// the same factor, so the value sets only the range its luminance-based steps see). A typical HDR TV's peak.
+constexpr float kHdrPeakNits = 1000.0f;
+
 const auto g_fg_process_start = std::chrono::steady_clock::now(); // (KYTY_FRAMEGEN_DUMP_AT times count from here)
 
 struct AlignedFree {
@@ -164,6 +168,8 @@ struct Generator::Impl {
 	bool                                     created = false, failed = false;
 	vk::Extent2D                             display {}, max_render {};
 	vk::Format                               format = vk::Format::eUndefined;
+	bool                                     hdr_wanted = false; // SetHdr: the next frames are PQ
+	bool                                     hdr        = false; // the contexts were created for PQ frames
 
 	// The guide buffer (imported DMA-BUF) and Kyty's own images FidelityFX reads.
 	vk::Buffer       buffer       = nullptr;
@@ -578,7 +584,7 @@ struct Generator::Impl {
 
 	// FidelityFX contexts and Kyty's images for this display size, format and render size.
 	bool EnsureResources(const Target& real, vk::Extent2D render) {
-		if (created && display == real.extent && format == real.format && render.width <= max_render.width &&
+		if (created && display == real.extent && format == real.format && hdr == hdr_wanted && render.width <= max_render.width &&
 		    render.height <= max_render.height) {
 			return true;
 		}
@@ -618,7 +624,8 @@ struct Generator::Impl {
 		// The title's depth convention, from its profile (Yotei: inverted, finite; Demon's Souls: inverted, infinite).
 		const uint32_t depth_flags = NativeUpscaler::FgDepthFlags();
 		description.flags = ((depth_flags & 1u) != 0 ? FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INVERTED : 0u) |
-		                    ((depth_flags & 2u) != 0 ? FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INFINITE : 0u);
+		                    ((depth_flags & 2u) != 0 ? FFX_FRAMEINTERPOLATION_ENABLE_DEPTH_INFINITE : 0u) |
+		                    (hdr_wanted ? FFX_FRAMEINTERPOLATION_ENABLE_HDR_COLOR_INPUT : 0u);
 		description.maxRenderSize                     = {cap.width, cap.height};
 		description.displaySize                       = {real.extent.width, real.extent.height};
 		description.backBufferFormat                  = ffxGetSurfaceFormatVK(static_cast<VkFormat>(real.format));
@@ -650,6 +657,7 @@ struct Generator::Impl {
 		created    = true;
 		display    = real.extent;
 		format     = real.format;
+		hdr        = hdr_wanted;
 		max_render = cap;
 		reset      = true;
 		Report("FSR 3.1 frame interpolation %ux%u, depth and motion up to %ux%u, optical flow %ux%u (FidelityFX SDK 1.1.4)\n",
@@ -937,8 +945,8 @@ struct Generator::Impl {
 		flow.opticalFlowVector          = b.fpGetResource(&b, flow_vectors);
 		flow.opticalFlowSCD             = b.fpGetResource(&b, scene_change);
 		flow.reset                      = !cont;
-		flow.backbufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
-		flow.minMaxLuminance            = {0.0f, 1.0f};
+		flow.backbufferTransferFunction = hdr ? FFX_BACKBUFFER_TRANSFER_FUNCTION_PQ : FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+		flow.minMaxLuminance            = {0.0f, hdr ? kHdrPeakNits : 1.0f};
 		KYTY_FG_CHECK2(ffxOpticalflowContextDispatch(&optical_flow, &flow));
 		if (!cont) fi_reset_pending = true;
 		reset = false;
@@ -970,9 +978,9 @@ struct Generator::Impl {
 		d.viewSpaceToMetersFactor         = 1.0f;
 		d.frameTimeDelta                  = f.frame_ms;
 		d.reset                           = fi_reset_pending;
-		d.backBufferTransferFunction      = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+		d.backBufferTransferFunction      = hdr ? FFX_BACKBUFFER_TRANSFER_FUNCTION_PQ : FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
 		d.minMaxLuminance[0]              = 0.0f;
-		d.minMaxLuminance[1]              = 1.0f;
+		d.minMaxLuminance[1]              = hdr ? kHdrPeakNits : 1.0f;
 		d.frameID                         = pair_id;
 		d.dilatedDepth                    = b.fpGetResource(&b, dilated_depth);
 		d.dilatedMotionVectors            = b.fpGetResource(&b, dilated_motion);
@@ -1021,8 +1029,8 @@ struct Generator::Impl {
 		flow.opticalFlowVector          = fv;
 		flow.opticalFlowSCD             = fs;
 		flow.reset                      = reset;
-		flow.backbufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
-		flow.minMaxLuminance            = {0.0f, 1.0f};
+		flow.backbufferTransferFunction = hdr ? FFX_BACKBUFFER_TRANSFER_FUNCTION_PQ : FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+		flow.minMaxLuminance            = {0.0f, hdr ? kHdrPeakNits : 1.0f};
 		KYTY_FG_CHECK(ffxOpticalflowContextDispatch(&optical_flow, &flow));
 
 		FfxFrameInterpolationDispatchDescription d {};
@@ -1047,9 +1055,9 @@ struct Generator::Impl {
 		d.viewSpaceToMetersFactor         = 1.0f;
 		d.frameTimeDelta                  = f.frame_ms;
 		d.reset                           = reset;
-		d.backBufferTransferFunction      = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+		d.backBufferTransferFunction      = hdr ? FFX_BACKBUFFER_TRANSFER_FUNCTION_PQ : FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
 		d.minMaxLuminance[0]              = 0.0f;
-		d.minMaxLuminance[1]              = 1.0f;
+		d.minMaxLuminance[1]              = hdr ? kHdrPeakNits : 1.0f;
 		d.frameID                         = frame_id;
 		d.dilatedDepth                    = dd;
 		d.dilatedMotionVectors            = dm;
@@ -1321,6 +1329,10 @@ bool Generator::Generate(vk::CommandBuffer command, const Target& real, const Ta
 }
 Generator::~Generator() = default;
 
+void Generator::SetHdr(bool pq) {
+	m_impl->hdr_wanted = pq;
+}
+
 bool Generator::Begin(vk::CommandBuffer command, const Target& real) {
 	if (!m_impl->UsesWorking(real)) return m_impl->Begin(command, real);
 	Target small {};
@@ -1371,6 +1383,7 @@ bool Active() {
 struct Generator::Impl {};
 Generator::Generator(GraphicContext&) {}
 Generator::~Generator() = default;
+void Generator::SetHdr(bool) {}
 bool Generator::Begin(vk::CommandBuffer, const Target&) {
 	return false;
 }
