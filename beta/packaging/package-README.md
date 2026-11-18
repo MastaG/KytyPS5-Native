@@ -227,6 +227,17 @@ With the stock amdgpu, frame generation can still stay paused in the heaviest sc
 
 ## Tested games
 
+I tested these four games on my AMD BC-250. The figures below are the frame rates I saw during play. Where I enabled frame generation, the 60 FPS figure includes generated frames.
+
+| Game | My gameplay results |
+| --- | --- |
+| <a href="https://www.playstation.com/en-us/games/astro-bot/"><img src="https://image.api.playstation.com/vulcan/ap/rnd/202406/0500/8f15268257b878597757fcc5f2c9545840867bc71fc863b1.png?w=400" width="96" height="96" alt="ASTRO BOT cover"></a><br>**ASTRO BOT** | 60 FPS. Helix improved image quality in my test. |
+| <a href="https://www.playstation.com/en-us/games/demons-souls/"><img src="https://image.api.playstation.com/vulcan/img/rnd/202011/1717/GemRaOZaCMhGxQ9dRhnQQyT5.png?w=400" width="96" height="96" alt="Demon’s Souls cover"></a><br>**Demon’s Souls** | Performance ran at 60 FPS. Cinematic ran at 30 FPS, or 60 FPS with frame generation. Helix improved image quality in my test. |
+| <a href="https://www.playstation.com/en-us/games/ghost-of-yotei/"><img src="https://image.api.playstation.com/vulcan/ap/rnd/202607/2723/890df32c227f619c5bd80e9f34ba2be53d0fea4b1615adee.png?w=400" width="96" height="96" alt="Ghost of Yōtei cover"></a><br>**Ghost of Yōtei** | Performance ran at 60 FPS. Quality and Ray Tracing each ran at 30 FPS, or 60 FPS with frame generation. |
+| <a href="https://www.playstation.com/en-us/games/marvels-wolverine/"><img src="https://image.api.playstation.com/vulcan/ap/rnd/202605/2215/a69481c5fa50fe19f42896d84fb7cbf37ab8646801a93322.png?w=400" width="96" height="96" alt="Marvel’s Wolverine cover"></a><br>**Marvel’s Wolverine** | Performance ran at 60 FPS. Fidelity ran at 30 FPS, or 60 FPS with frame generation. I played past the spot that previously crashed. |
+
+### Tested versions and package defaults
+
 What this package was tested with on BC-250 hardware. Other games and versions may work; KytyPS5 applies
 version-specific fixes only to the exact versions listed.
 
