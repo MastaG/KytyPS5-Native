@@ -1099,7 +1099,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		case vk::Format::eA2R10G10B10UnormPack32:
 			// FSR's Vulkan backend accepts A2B10G10R10. Convert the displayed channels on the GPU rather than
 			// reinterpreting the bits (which swaps red/blue), so Astro can use the same interpolation path.
-			if (FrameGen::Enabled() && !IsHdrVideoOutPixelFormat(video_out_format) && !headset) frame_format = vk::Format::eA2B10G10R10UnormPack32;
+			if (FrameGen::Enabled() && !headset) frame_format = vk::Format::eA2B10G10R10UnormPack32;
 			break;
 		default: break;
 	}
@@ -1364,7 +1364,7 @@ bool Presenter::Impl::EnqueueDynamic(Frame& real) {
 		}
 		return false;
 	}
-	if ((real.source_flags & 4u) != 0 || real.blank || !(real.image.usage & vk::ImageUsageFlagBits::eSampled)) {
+	if (real.blank || !(real.image.usage & vk::ImageUsageFlagBits::eSampled)) {
 		return false;
 	}
 	if (!fg_was_dynamic) {
@@ -1425,7 +1425,8 @@ bool Presenter::Impl::DynamicTick() {
 	FgReal*        B       = fg_reals.size() >= 2 ? &fg_reals[1] : nullptr;
 	CommandBuffer* command = nullptr;
 	const bool     usable  = fg != nullptr && FrameGen::Active() && B != nullptr && A.frame->image.extent == B->frame->image.extent &&
-	                    A.frame->image.format == B->frame->image.format;
+	                    A.frame->image.format == B->frame->image.format &&
+	                    (A.frame->source_flags & 4u) == (B->frame->source_flags & 4u); // not across an HDR switch
 	const vk::Extent2D extent = B != nullptr ? vk::Extent2D {B->frame->image.extent.width, B->frame->image.extent.height} : vk::Extent2D {};
 	FrameGen::Target   bt {}, at {};
 	if (B != nullptr) {
@@ -1441,6 +1442,7 @@ bool Presenter::Impl::DynamicTick() {
 		const bool follows = fg_pair_b == A.frame;
 		B->frame->Transit(command->Handle(), vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
 		A.frame->Transit(command->Handle(), vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
+		fg->SetHdr((B->frame->source_flags & 4u) != 0); // PQ frames are interpolated as PQ
 		ready = fg->Advance(command->Handle(), follows ? &at : nullptr, bt, B->guides, !follows);
 		g_dyn.advances++;
 		g_dyn.resets += follows ? 0 : 1;
@@ -1464,7 +1466,7 @@ bool Presenter::Impl::DynamicTick() {
 	if (usable && ready && wanted) {
 		if (command == nullptr) command = &present_scheduler.BeginCommand();
 		generated               = frames.Acquire(extent, B->frame->image.format);
-		generated->source_flags = B->frame->source_flags; // PQ frames never get here; keeps the linear flag
+		generated->source_flags = B->frame->source_flags; // PQ or SDR, and the linear flag, as its source
 		generated->blank        = false;
 		generated->Configure(window.graphic_ctx, extent, B->frame->image.format);
 		B->frame->Transit(command->Handle(), vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
@@ -1564,10 +1566,11 @@ bool Presenter::Impl::TryFrameGen(Frame& real) {
 		             real.blank ? 1u : 0u, static_cast<unsigned>(static_cast<VkImageUsageFlags>(real.image.usage)),
 		             static_cast<unsigned long long>(real.fg_boundary));
 	}
-	if ((real.source_flags & 4u) != 0 || real.blank || !(real.image.usage & vk::ImageUsageFlagBits::eSampled)) {
+	if (real.blank || !(real.image.usage & vk::ImageUsageFlagBits::eSampled)) {
 		fg->Reset();
 		return false;
 	}
+	fg->SetHdr((real.source_flags & 4u) != 0); // PQ frames are interpolated as PQ
 	const vk::Extent2D extent {real.image.extent.width, real.image.extent.height};
 	auto&              command = present_scheduler.BeginCommand();
 	real.Transit(command.Handle(), vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
@@ -1577,7 +1580,7 @@ bool Presenter::Impl::TryFrameGen(Frame& real) {
 	bool                   dumping   = false;
 	if (fg->Begin(command.Handle(), source)) {
 		generated               = frames.Acquire(extent, real.image.format);
-		generated->source_flags = real.source_flags; // PQ frames never get here; keeps the linear flag
+		generated->source_flags = real.source_flags; // PQ or SDR, and the linear flag, as its source
 		generated->blank        = false;
 		generated->Configure(window.graphic_ctx, extent, real.image.format);
 		real.Transit(command.Handle(), vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
